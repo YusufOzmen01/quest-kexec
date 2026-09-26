@@ -6,6 +6,7 @@
 # the headset is running, so Module.symvers carries the right CRCs.
 ifneq ($(KERNELRELEASE),)
 obj-m += quest_kexec.o marker_read.o
+obj-m += usb_log.o
 quest_kexec-y := loader.o transition.o
 # Without this define the module can only stage (execute=1 is refused).
 ccflags-y += -DQKX_ENABLE_EXPERIMENTAL_JUMP
