@@ -1,0 +1,203 @@
+From 5d4273bfeb7ad4379dbbc93f4bd0fbbe495056d3 Mon Sep 17 00:00:00 2001
+From: yusuf <marulumbenaq@gmail.com>
+Date: Sat, 26 Sep 2026 21:06:25 +0300
+Subject: [PATCH 2/3] qkx: disable stale SPMI IRQs, SMB5 skip initial-status
+ handlers, probe_skip writable
+
+---
+ drivers/base/dd.c                     |  3 ++-
+ drivers/power/supply/qcom/qpnp-smb5.c | 36 +++++++++++++++++++++++++++
+ drivers/spmi/spmi-pmic-arb.c          | 10 ++++++++
+ 3 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/base/dd.c b/drivers/base/dd.c
+index 2f822cdc3a..cf26ea61ff 100644
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -208,7 +208,8 @@ bool qkx_probe_trace;
+ static char *qkx_probe_skip =
+ 	"c440000.qcom,spmi:qcom,pm8150b@2:qcom,qpnp-smb5|"
+ 	"ac4d000.qcom,cpas-cdm0";
+-core_param(qkx_probe_skip, qkx_probe_skip, charp, 0444);
++/* Writable so a parked device can be released after USB logging is up. */
++core_param(qkx_probe_skip, qkx_probe_skip, charp, 0644);
+ 
+ static bool qkx_probe_is_skipped(const char *name)
+ {
+diff --git a/drivers/power/supply/qcom/qpnp-smb5.c b/drivers/power/supply/qcom/qpnp-smb5.c
+index f6e66a04d1..11df10f366 100644
+--- a/drivers/power/supply/qcom/qpnp-smb5.c
++++ b/drivers/power/supply/qcom/qpnp-smb5.c
+@@ -3134,6 +3134,13 @@ static int smb5_post_init(struct smb5 *chip)
+  * DETERMINE INITIAL STATUS *
+  ****************************/
+ 
++/* qkx: kexec-handoff probe checkpoints; delay lets live log reach the host. */
++#define QKX_SMB5_STEP(what) do { pr_emerg("qkxsmb5: before %s\n", what); msleep(100); } while (0)
++
++/* qkx: skip hand-run IRQ handlers after kexec; real IRQs report the same state. */
++static bool qkx_skip_initial;
++module_param(qkx_skip_initial, bool, 0444);
++
+ static int smb5_determine_initial_status(struct smb5 *chip)
+ {
+ 	struct smb_irq_data irq_data = {chip, "determine-initial-status"};
+@@ -3151,16 +3158,32 @@ static int smb5_determine_initial_status(struct smb5 *chip)
+ 	if (chg->bms_psy)
+ 		smblib_suspend_on_debug_battery(chg);
+ 
++	if (qkx_skip_initial) {
++		pr_emerg("qkxsmb5: skipping initial-status handlers\n");
++		return 0;
++	}
++
++	QKX_SMB5_STEP("usb_plugin_irq_handler");
+ 	usb_plugin_irq_handler(0, &irq_data);
++	QKX_SMB5_STEP("dc_plugin_irq_handler");
+ 	dc_plugin_irq_handler(0, &irq_data);
++	QKX_SMB5_STEP("typec_attach_detach_irq_handler");
+ 	typec_attach_detach_irq_handler(0, &irq_data);
++	QKX_SMB5_STEP("typec_state_change_irq_handler");
+ 	typec_state_change_irq_handler(0, &irq_data);
++	QKX_SMB5_STEP("usb_source_change_irq_handler");
+ 	usb_source_change_irq_handler(0, &irq_data);
++	QKX_SMB5_STEP("chg_state_change_irq_handler");
+ 	chg_state_change_irq_handler(0, &irq_data);
++	QKX_SMB5_STEP("icl_change_irq_handler");
+ 	icl_change_irq_handler(0, &irq_data);
++	QKX_SMB5_STEP("batt_temp_changed_irq_handler");
+ 	batt_temp_changed_irq_handler(0, &irq_data);
++	QKX_SMB5_STEP("wdog_bark_irq_handler");
+ 	wdog_bark_irq_handler(0, &irq_data);
++	QKX_SMB5_STEP("typec_or_rid_detection_change_irq_handler");
+ 	typec_or_rid_detection_change_irq_handler(0, &irq_data);
++	QKX_SMB5_STEP("wdog_snarl_irq_handler");
+ 	wdog_snarl_irq_handler(0, &irq_data);
+ 
+ 	return 0;
+@@ -3717,6 +3740,7 @@ static int smb5_probe(struct platform_device *pdev)
+ 		return -EINVAL;
+ 	}
+ 
++	QKX_SMB5_STEP("smb5_chg_config_init");
+ 	rc = smb5_chg_config_init(chip);
+ 	if (rc < 0) {
+ 		if (rc != -EPROBE_DEFER)
+@@ -3724,6 +3748,7 @@ static int smb5_probe(struct platform_device *pdev)
+ 		return rc;
+ 	}
+ 
++	QKX_SMB5_STEP("smb5_parse_dt");
+ 	rc = smb5_parse_dt(chip);
+ 	if (rc < 0) {
+ 		pr_err("Couldn't parse device tree rc=%d\n", rc);
+@@ -3736,6 +3761,7 @@ static int smb5_probe(struct platform_device *pdev)
+ 	else
+ 		return -EPROBE_DEFER;
+ 
++	QKX_SMB5_STEP("smblib_init");
+ 	rc = smblib_init(chg);
+ 	if (rc < 0) {
+ 		pr_err("Smblib_init failed rc=%d\n", rc);
+@@ -3776,6 +3802,7 @@ static int smb5_probe(struct platform_device *pdev)
+ 		goto cleanup;
+ 	}
+ 
++	QKX_SMB5_STEP("smb5_init_hw");
+ 	rc = smb5_init_hw(chip);
+ 	if (rc < 0) {
+ 		pr_err("Couldn't initialize hardware rc=%d\n", rc);
+@@ -3791,6 +3818,7 @@ static int smb5_probe(struct platform_device *pdev)
+ 	 * only.
+ 	 */
+ 	if (!chg->pd_not_supported) {
++		QKX_SMB5_STEP("smb5_init_vbus_regulator");
+ 		rc = smb5_init_vbus_regulator(chip);
+ 		if (rc < 0) {
+ 			pr_err("Couldn't initialize vbus regulator rc=%d\n",
+@@ -3798,6 +3826,7 @@ static int smb5_probe(struct platform_device *pdev)
+ 			goto cleanup;
+ 		}
+ 
++		QKX_SMB5_STEP("smb5_init_vconn_regulator");
+ 		rc = smb5_init_vconn_regulator(chip);
+ 		if (rc < 0) {
+ 			pr_err("Couldn't initialize vconn regulator rc=%d\n",
+@@ -3805,6 +3834,7 @@ static int smb5_probe(struct platform_device *pdev)
+ 			goto cleanup;
+ 		}
+ 
++		QKX_SMB5_STEP("smb5_init_otg_boost_regulator");
+ 		rc = smb5_init_otg_boost_regulator(chip);
+ 		if (rc < 0) {
+ 			pr_err("Couldn't initialize otg boost regulator rc=%d\n",
+@@ -3817,6 +3847,7 @@ static int smb5_probe(struct platform_device *pdev)
+ 	case PM8150B_SUBTYPE:
+ 	case PM6150_SUBTYPE:
+ 	case PM7250B_SUBTYPE:
++		QKX_SMB5_STEP("smb5_init_dc_psy");
+ 		rc = smb5_init_dc_psy(chip);
+ 		if (rc < 0) {
+ 			pr_err("Couldn't initialize dc psy rc=%d\n", rc);
+@@ -3827,6 +3858,7 @@ static int smb5_probe(struct platform_device *pdev)
+ 		break;
+ 	}
+ 
++	QKX_SMB5_STEP("smb5_init_usb_psy");
+ 	rc = smb5_init_usb_psy(chip);
+ 	if (rc < 0) {
+ 		pr_err("Couldn't initialize usb psy rc=%d\n", rc);
+@@ -3845,18 +3877,21 @@ static int smb5_probe(struct platform_device *pdev)
+ 		goto cleanup;
+ 	}
+ 
++	QKX_SMB5_STEP("smb5_init_batt_psy");
+ 	rc = smb5_init_batt_psy(chip);
+ 	if (rc < 0) {
+ 		pr_err("Couldn't initialize batt psy rc=%d\n", rc);
+ 		goto cleanup;
+ 	}
+ 
++	QKX_SMB5_STEP("smb5_init_typec_class");
+ 	rc = smb5_init_typec_class(chip);
+ 	if (rc < 0) {
+ 		pr_err("Couldn't initialize typec class rc=%d\n", rc);
+ 		goto cleanup;
+ 	}
+ 
++	QKX_SMB5_STEP("smb5_determine_initial_status");
+ 	rc = smb5_determine_initial_status(chip);
+ 	if (rc < 0) {
+ 		pr_err("Couldn't determine initial status rc=%d\n",
+@@ -3864,6 +3899,7 @@ static int smb5_probe(struct platform_device *pdev)
+ 		goto cleanup;
+ 	}
+ 
++	QKX_SMB5_STEP("smb5_request_interrupts");
+ 	rc = smb5_request_interrupts(chip);
+ 	if (rc < 0) {
+ 		pr_err("Couldn't request interrupts rc=%d\n", rc);
+diff --git a/drivers/spmi/spmi-pmic-arb.c b/drivers/spmi/spmi-pmic-arb.c
+index 14c1e38939..bfd53cee60 100644
+--- a/drivers/spmi/spmi-pmic-arb.c
++++ b/drivers/spmi/spmi-pmic-arb.c
+@@ -491,6 +491,16 @@ static void cleanup_irq(struct spmi_pmic_arb *pmic_arb, u16 apid, int id)
+ 	dev_err_ratelimited(&pmic_arb->spmic->dev, "%s apid=%d sid=0x%x per=0x%x irq=%d\n",
+ 			__func__, apid, sid, per, id);
+ 	writel_relaxed(irq_mask, pmic_arb->ver_ops->irq_clear(pmic_arb, apid));
++	/* qkx: Android leaves interrupts enabled in peripherals whose driver
++	 * has not probed yet after kexec. Clearing alone lets a level source
++	 * refire forever, so also disable it at the peripheral; the owning
++	 * driver re-enables it through request_irq().
++	 */
++	if (pmic_arb_write_cmd(pmic_arb->spmic, SPMI_CMD_EXT_WRITEL, sid,
++			       (per << 8) + QPNPINT_REG_EN_CLR, &irq_mask, 1))
++		dev_err_ratelimited(&pmic_arb->spmic->dev,
++				    "failed to disable irq sid=0x%x per=0x%x irq=%d\n",
++				    sid, per, id);
+ }
+ 
+ static void periph_interrupt(struct spmi_pmic_arb *pmic_arb, u16 apid)
+-- 
+2.55.0
+

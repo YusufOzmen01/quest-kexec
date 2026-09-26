@@ -1,0 +1,2103 @@
+From db0d5b2b828b20867cbc001f0b0157caee313556 Mon Sep 17 00:00:00 2001
+From: yusuf <marulumbenaq@gmail.com>
+Date: Sat, 26 Sep 2026 20:17:50 +0300
+Subject: [PATCH 1/3] qkx: kexec target patches (rebased from fa2e480a85)
+
+---
+ arch/arm64/kernel/head.S                      |   5 +
+ drivers/base/dd.c                             |  94 +++--
+ drivers/clk/qcom/clk-aop-qmp.c                |  16 +-
+ drivers/clk/qcom/dispcc-kona.c                |  34 +-
+ drivers/clk/qcom/gdsc-regulator.c             |  15 +-
+ drivers/cpufreq/cpufreq_stats.c               |  35 +-
+ drivers/iommu/arm-smmu.c                      |  12 +-
+ drivers/irqchip/irq-gic-v3.c                  |  19 ++
+ drivers/mailbox/msm_qmp.c                     | 132 ++++++-
+ drivers/misc/qseecom.c                        |   8 +-
+ drivers/of/device.c                           |  17 +-
+ drivers/power/reset/msm-poweroff.c            |  27 ++
+ .../soc/qcom/msm_bus/msm_bus_fabric_rpmh.c    | 113 +++++-
+ .../soc/qcom/msm_bus/msm_bus_proxy_client.c   |   8 +-
+ drivers/usb/dwc3/dwc3-msm.c                   |  33 +-
+ drivers/usb/dwc3/gadget.c                     |  91 +++++
+ drivers/usb/phy/phy-msm-ssusb-qmp.c           |   8 +
+ drivers/usb/phy/phy.c                         |  22 +-
+ drivers/watchdog/watchdog_core.c              |   5 +-
+ init/main.c                                   | 321 +++++++++++++++++-
+ net/ipv4/ip_output.c                          |   1 +
+ .../camera/drivers/cam_cdm/cam_cdm_hw_core.c  |  50 +++
+ .../camera/drivers/cam_cpas/cam_cpas_soc.c    |   9 +-
+ .../cam_sensor_module/cam_cci/cam_cci_soc.c   |   8 +-
+ .../camera/drivers/cam_smmu/cam_smmu_api.c    |   3 +
+ techpack/display/msm/dsi/dsi_ctrl.c           |  24 +-
+ techpack/display/msm/sde_power_handle.c       |  38 ++-
+ techpack/display/msm/sde_rsc.c                |   3 +-
+ 28 files changed, 1033 insertions(+), 118 deletions(-)
+
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 29f67c995d..072ae6663a 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -117,6 +117,11 @@ pe_header:
+ 	 *                                        current RELR displacement
+ 	 */
+ ENTRY(stext)
++	/* The replacement boot must not inherit or re-arm the AP watchdog. */
++	movz	x9, #0
++	movk	x9, #0x17c1, lsl #16
++	str	wzr, [x9, #0x08]
++	dsb	sy
+ 	bl	preserve_boot_args
+ 	bl	el2_setup			// Drop to EL1, w0=cpu_boot_mode
+ 	adrp	x23, __PHYS_OFFSET
+diff --git a/drivers/base/dd.c b/drivers/base/dd.c
+index 3bc011d40f..2f822cdc3a 100644
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -202,14 +202,45 @@ void device_unblock_probing(void)
+ 	driver_deferred_probe_trigger();
+ }
+ 
+-static void enable_trigger_defer_cycle(void)
++/* qkx: explicit diagnostic kick enables slow per-probe tracing. */
++bool qkx_probe_trace;
++/* Devices known to be unsafe or blocking when inherited across kexec. */
++static char *qkx_probe_skip =
++	"c440000.qcom,spmi:qcom,pm8150b@2:qcom,qpnp-smb5|"
++	"ac4d000.qcom,cpas-cdm0";
++core_param(qkx_probe_skip, qkx_probe_skip, charp, 0444);
++
++static bool qkx_probe_is_skipped(const char *name)
++{
++	const char *p = qkx_probe_skip;
++	size_t n;
++
++	while (p && *p) {
++		n = strcspn(p, "|");
++		if (strlen(name) == n && !strncmp(name, p, n))
++			return true;
++		p += n;
++		if (*p == '|')
++			p++;
++	}
++	return false;
++}
++
++void qkx_deferred_probe_kick(void)
+ {
++	pr_emerg("qkx: userspace kick of deferred probing\n");
++	qkx_probe_trace = true;
+ 	driver_deferred_probe_enable = true;
+ 	driver_deferred_probe_trigger();
+-	/*
+-	 * Sort as many dependencies as possible before the next initcall
+-	 * level
++}
++
++static void enable_trigger_defer_cycle(void)
++{
++	/* The inherited-state hazards are parked by qkx_probe_skip, so run the
++	 * vendor kernel's normal dependency-resolution cycle at each sync level.
+ 	 */
++	driver_deferred_probe_enable = true;
++	driver_deferred_probe_trigger();
+ 	flush_work(&deferred_probe_work);
+ }
+ 
+@@ -311,16 +342,9 @@ static int deferred_probe_enable_fn(void)
+ 	deferred_devices = debugfs_create_file("devices_deferred", 0444, NULL,
+ 					       NULL, &deferred_devs_fops);
+ 
+-	/* Enable deferred probing for all time */
+-	enable_trigger_defer_cycle();
+-	initcalls_done = true;
+-
+-	/*
+-	 * Trigger deferred probe again, this time we won't defer anything
+-	 * that is optional
+-	 */
++	driver_deferred_probe_enable = true;
+ 	driver_deferred_probe_trigger();
+-	flush_work(&deferred_probe_work);
++	initcalls_done = true;
+ 
+ 	if (deferred_probe_timeout > 0) {
+ 		schedule_delayed_work(&deferred_probe_timeout_work,
+@@ -481,8 +505,14 @@ static int really_probe(struct device *dev, struct device_driver *drv)
+ 	int local_trigger_count = atomic_read(&deferred_trigger_count);
+ 	bool test_remove = IS_ENABLED(CONFIG_DEBUG_TEST_DRIVER_REMOVE) &&
+ 			   !drv->suppress_bind_attrs;
++	bool qkx_trace = strstr(dev_name(dev), "ssusb") ||
++			 strstr(dev_name(dev), "ssphy") ||
++			 strstr(dev_name(dev), "dwc3");
+ 
+ 	if (defer_all_probes) {
++		if (qkx_trace)
++			dev_info(dev, "qkx: defer_all_probes for %s\n",
++				 drv->name);
+ 		/*
+ 		 * Value of defer_all_probes can be set only by
+ 		 * device_defer_all_probes_enable() which, in turn, will call
+@@ -496,8 +526,12 @@ static int really_probe(struct device *dev, struct device_driver *drv)
+ 	ret = device_links_check_suppliers(dev);
+ 	if (ret == -EPROBE_DEFER)
+ 		driver_deferred_probe_add_trigger(dev, local_trigger_count);
+-	if (ret)
++	if (ret) {
++		if (qkx_trace)
++			dev_info(dev, "qkx: suppliers ret=%d drv=%s\n",
++				 ret, drv->name);
+ 		return ret;
++	}
+ 
+ 	atomic_inc(&probe_count);
+ 	pr_debug("bus: '%s': %s: probing driver %s with device %s\n",
+@@ -513,12 +547,18 @@ static int really_probe(struct device *dev, struct device_driver *drv)
+ 
+ 	/* If using pinctrl, bind pins now before probing */
+ 	ret = pinctrl_bind_pins(dev);
+-	if (ret)
++	if (ret) {
++		if (qkx_trace)
++			dev_info(dev, "qkx: pinctrl ret=%d\n", ret);
+ 		goto pinctrl_bind_failed;
++	}
+ 
+ 	ret = dma_configure(dev);
+-	if (ret)
++	if (ret) {
++		if (qkx_trace)
++			dev_info(dev, "qkx: dma_configure ret=%d\n", ret);
+ 		goto probe_failed;
++	}
+ 
+ 	if (driver_sysfs_add(dev)) {
+ 		printk(KERN_ERR "%s: driver_sysfs_add(%s) failed\n",
+@@ -532,15 +572,25 @@ static int really_probe(struct device *dev, struct device_driver *drv)
+ 			goto probe_failed;
+ 	}
+ 
++	if (qkx_probe_is_skipped(dev_name(dev))) {
++		dev_warn_once(dev, "qkx: probe parked for kexec safety\n");
++		ret = -EPROBE_DEFER;
++		goto probe_failed;
++	}
++	if (qkx_probe_trace) {
++		pr_emerg("qkx: probe %s drv=%s\n", dev_name(dev), drv->name);
++		/* Diagnostic mode only: let the line reach the host before MMIO. */
++		msleep(200);
++	}
+ 	if (dev->bus->probe) {
+ 		ret = dev->bus->probe(dev);
+-		if (ret)
+-			goto probe_failed;
+ 	} else if (drv->probe) {
+ 		ret = drv->probe(dev);
+-		if (ret)
+-			goto probe_failed;
+ 	}
++	if (qkx_probe_trace)
++		pr_emerg("qkx: probe %s ret=%d\n", dev_name(dev), ret);
++	if (ret)
++		goto probe_failed;
+ 
+ 	if (test_remove) {
+ 		test_remove = false;
+@@ -591,11 +641,15 @@ static int really_probe(struct device *dev, struct device_driver *drv)
+ 	switch (ret) {
+ 	case -EPROBE_DEFER:
+ 		/* Driver requested deferred probing */
++		if (qkx_trace)
++			dev_info(dev, "qkx: probe deferred (ret=%d)\n", ret);
+ 		dev_dbg(dev, "Driver %s requests probe deferral\n", drv->name);
+ 		driver_deferred_probe_add_trigger(dev, local_trigger_count);
+ 		break;
+ 	case -ENODEV:
+ 	case -ENXIO:
++		if (qkx_trace)
++			dev_info(dev, "qkx: probe rejects match (ret=%d)\n", ret);
+ 		pr_debug("%s: probe of %s rejects match %d\n",
+ 			 drv->name, dev_name(dev), ret);
+ 		break;
+diff --git a/drivers/clk/qcom/clk-aop-qmp.c b/drivers/clk/qcom/clk-aop-qmp.c
+index 0f7b77d012..f235b850c3 100644
+--- a/drivers/clk/qcom/clk-aop-qmp.c
++++ b/drivers/clk/qcom/clk-aop-qmp.c
+@@ -76,6 +76,7 @@ struct clk_aop_qmp {
+ };
+ 
+ static DEFINE_MUTEX(clk_aop_lock);
++extern bool qkx_qmp_inherited_ready;
+ 
+ static unsigned long clk_aop_qmp_recalc_rate(struct clk_hw *hw,
+ 						unsigned long parent_rate)
+@@ -329,9 +330,18 @@ static int aop_qmp_clk_probe(struct platform_device *pdev)
+ 	 * Proxy vote on the QDSS clock. This is needed to avoid issues with
+ 	 * excessive requests on the QMP layer during the QDSS driver probe.
+ 	 */
+-	ret = clk_aop_qmp_prepare(&qdss_qmp_clk.hw);
+-	if (ret < 0)
+-		goto fail;
++	if (qkx_qmp_inherited_ready) {
++		/* Android's CLK_ENABLE_HAND_OFF QDSS proxy vote remains active.
++		 * Sending the duplicate first vote after adopting its QMP link is
++		 * not acknowledged by AOP, exactly what enabled is meant to avoid.
++		 */
++		qdss_qmp_clk.enabled = true;
++		dev_info(&pdev->dev, "qkx: adopting inherited QDSS proxy vote\n");
++	} else {
++		ret = clk_aop_qmp_prepare(&qdss_qmp_clk.hw);
++		if (ret < 0)
++			goto fail;
++	}
+ 
+ 	for (i = 0; i < num_clks; i++) {
+ 		if (!aop_qmp_clk_hws[i])
+diff --git a/drivers/clk/qcom/dispcc-kona.c b/drivers/clk/qcom/dispcc-kona.c
+index 7fe18865f5..91e1c511be 100644
+--- a/drivers/clk/qcom/dispcc-kona.c
++++ b/drivers/clk/qcom/dispcc-kona.c
+@@ -1532,6 +1532,27 @@ static int disp_cc_kona_probe(struct platform_device *pdev)
+ 		return PTR_ERR(regmap);
+ 	}
+ 
++	/*
++	 * qkx: disp_cc and gcc are both subsys_initcall; if disp_cc's link
++	 * order runs first, devm_clk_get("cfg_ahb_clk") returns -EPROBE_DEFER
++	 * and (with deferred-probe retries disabled kernel-wide in this
++	 * diagnostic build) that failure was permanent.
++	 *
++	 * A local msleep-based retry loop was tried here and made things
++	 * worse: subsys_initcall runs single-threaded, so blocking inside
++	 * disp_cc's own probe also blocks every later subsys_initcall from
++	 * running at all -- including gcc-kona's, which is the one thing
++	 * disp_cc is waiting on. Confirmed directly: dmesg showed a ~20s gap
++	 * with zero log lines from any driver, ending exactly at the retry
++	 * loop's own deadline, with gcc-kona's "Registered GCC clocks"
++	 * appearing only after. The loop was waiting for something it was
++	 * itself preventing from happening.
++	 *
++	 * The actual fix is below: disp_cc_kona_init() is registered at
++	 * fs_initcall, one level after subsys_initcall, so gcc-kona (and the
++	 * RPMh regulator framework, which registers even earlier at
++	 * arch_initcall) are guaranteed to have already run.
++	 */
+ 	clk = devm_clk_get(&pdev->dev, "cfg_ahb_clk");
+ 	if (IS_ERR(clk)) {
+ 		if (PTR_ERR(clk) != -EPROBE_DEFER)
+@@ -1550,8 +1571,14 @@ static int disp_cc_kona_probe(struct platform_device *pdev)
+ 
+ 	dispcc_bus_id = msm_bus_scale_register_client(&clk_debugfs_scale_table);
+ 	if (!dispcc_bus_id) {
+-		dev_err(&pdev->dev, "Unable to register for bw voting\n");
+-		return -EPROBE_DEFER;
++		/*
++		 * qkx: after kexec msm_bus may never come up (deferred retries
++		 * are disabled in this diagnostic kernel), which would leave
++		 * every display clock missing. The vote only serves debugfs
++		 * clock measurement and all users check for a zero id.
++		 */
++		dev_warn(&pdev->dev,
++			 "qkx: bw voting unavailable; continuing without it\n");
+ 	}
+ 	for (i = 0; i < ARRAY_SIZE(disp_cc_kona_clocks); i++)
+ 		if (disp_cc_kona_clocks[i])
+@@ -1587,7 +1614,8 @@ static int __init disp_cc_kona_init(void)
+ {
+ 	return platform_driver_register(&disp_cc_kona_driver);
+ }
+-subsys_initcall(disp_cc_kona_init);
++/* qkx: was subsys_initcall; see the ordering comment in disp_cc_kona_probe(). */
++fs_initcall(disp_cc_kona_init);
+ 
+ static void __exit disp_cc_kona_exit(void)
+ {
+diff --git a/drivers/clk/qcom/gdsc-regulator.c b/drivers/clk/qcom/gdsc-regulator.c
+index ee8b6a2cde..f3fe105da1 100644
+--- a/drivers/clk/qcom/gdsc-regulator.c
++++ b/drivers/clk/qcom/gdsc-regulator.c
+@@ -842,14 +842,17 @@ static int gdsc_get_resources(struct gdsc *sc, struct platform_device *pdev)
+ 
+ 		sc->bus_handle = msm_bus_scale_register_client(sc->bus_pdata);
+ 		if (!sc->bus_handle) {
+-			dev_err(&pdev->dev, "Failed to register bus client\n");
+ 			/*
+-			 * msm_bus_scale_register_client() returns 0 for all
+-			 * errors including when called before the bus driver
+-			 * probes.  Therefore, return -EPROBE_DEFER here so that
+-			 * probing can be retried and this case handled.
++			 * qkx: msm_bus does not reliably reprobe after kexec and
++			 * deferred-probe retries are disabled in this diagnostic
++			 * kernel. Returning -EPROBE_DEFER here permanently removes
++			 * GDSCs such as mdss_core_gdsc, preventing SDE RSC and DRM
++			 * from probing. All bus operations below already guard a
++			 * zero handle, so retain the inherited interconnect state
++			 * and continue without an explicit vote.
+ 			 */
+-			return -EPROBE_DEFER;
++			dev_warn(&pdev->dev,
++				 "qkx: bus client unavailable; continuing without bus scaling\n");
+ 		}
+ 	}
+ 
+diff --git a/drivers/cpufreq/cpufreq_stats.c b/drivers/cpufreq/cpufreq_stats.c
+index 9ecc8a86f4..17e717d4a4 100644
+--- a/drivers/cpufreq/cpufreq_stats.c
++++ b/drivers/cpufreq/cpufreq_stats.c
+@@ -299,38 +299,17 @@ void cpufreq_stats_record_transition(struct cpufreq_policy *policy,
+ 	stats->total_trans++;
+ }
+ 
++/*
++ * QKX: the vendor per-cpu idle/busy time-in-state accounting races
++ * against cpufreq_stats_create_table() on secondary CPUs (policy stats are
++ * published before the tables are fully coherent), causing NULL derefs in
++ * the idle path.  The accounting is pure diagnostics; disable it for the
++ * kexec diagnostic kernel.
++ */
+ void cpufreq_stats_update_busy_time(struct task_struct *p, u64 cputime)
+ {
+-	struct cpufreq_policy *policy;
+-	unsigned long flags;
+-	unsigned int cpu;
+-
+-	cpu = task_cpu(p);
+-	policy = cpufreq_cpu_get(cpu);
+-	if (policy) {
+-		if (policy->stats && !is_idle_task(p)) {
+-			spin_lock_irqsave(&cpufreq_stats_lock, flags);
+-			policy->stats->busy_time_in_state_per_cpu[cpu - policy->stats->cpu][policy->stats->last_index] += cputime;
+-			spin_unlock_irqrestore(&cpufreq_stats_lock, flags);
+-		}
+-		cpufreq_cpu_put(policy);
+-	}
+ }
+ 
+ void cpufreq_stats_update_idle_time(u64 cputime)
+ {
+-	struct cpufreq_policy *policy;
+-	unsigned long flags;
+-	unsigned int cpu;
+-
+-	cpu = smp_processor_id();
+-	policy = cpufreq_cpu_get(cpu);
+-	if (policy) {
+-		if (policy->stats) {
+-			spin_lock_irqsave(&cpufreq_stats_lock, flags);
+-			policy->stats->idle_time_in_state_per_cpu[cpu - policy->stats->cpu][policy->stats->last_index] += cputime;
+-			spin_unlock_irqrestore(&cpufreq_stats_lock, flags);
+-		}
+-		cpufreq_cpu_put(policy);
+-	}
+ }
+diff --git a/drivers/iommu/arm-smmu.c b/drivers/iommu/arm-smmu.c
+index f23ac48009..651fd11e14 100644
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@ -5607,8 +5607,16 @@ static int arm_smmu_init_bus_scaling(struct arm_smmu_power_resources *pwr)
+ 
+ 	pwr->bus_client = msm_bus_scale_register_client(pwr->bus_dt_data);
+ 	if (!pwr->bus_client) {
+-		dev_err(dev, "Bus client registration failed\n");
+-		return -EPROBE_DEFER;
++		/*
++		 * qkx: after kexec the msm_bus fabric driver may never come up
++		 * (deferred retries are disabled in this diagnostic kernel), which
++		 * would leave apps-smmu permanently dead and every SMMU client
++		 * (e.g. dwc3 USB) running against stale translation. Bus voting is
++		 * an optimization; continue without it.
++		 */
++		dev_warn(dev,
++			 "qkx: bus client registration failed; continuing without bus scaling\n");
++		return 0;
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/irqchip/irq-gic-v3.c b/drivers/irqchip/irq-gic-v3.c
+index 7525167d47..074993ec62 100644
+--- a/drivers/irqchip/irq-gic-v3.c
++++ b/drivers/irqchip/irq-gic-v3.c
+@@ -513,6 +513,25 @@ static void __init gic_dist_init(void)
+ 	for (i = 32; i < gic_data.irq_nr; i += 32)
+ 		writel_relaxed(~0, base + GICD_IGROUPR + i / 8);
+ 
++	/*
++	 * qkx: kexec hygiene. The previous kernel may have died with SPIs
++	 * left pending or (worse) active without EOI. A GICv3 SPI stuck in
++	 * active state is never re-signalled, permanently wedging the
++	 * interrupt line (e.g. dwc3 serving ADB at kexec time). Clear both
++	 * states for all SPIs while the distributor is disabled.
++	 */
++	for (i = 32; i < gic_data.irq_nr; i += 32) {
++		u32 act = readl_relaxed(base + GICD_ISACTIVER + i / 8);
++		u32 pend = readl_relaxed(base + GICD_ISPENDR + i / 8);
++
++		if (act || pend)
++			pr_info("qkx: gic stale SPI state at kexec: hwirq %d-%d act=%08x pend=%08x\n",
++				i, min(i + 31, gic_data.irq_nr - 1), act, pend);
++
++		writel_relaxed(~0, base + GICD_ICPENDR + i / 8);
++		writel_relaxed(~0, base + GICD_ICACTIVER + i / 8);
++	}
++
+ 	gic_dist_config(base, gic_data.irq_nr, gic_dist_wait_for_rwp);
+ 
+ 	/* Enable distributor with ARE, Group1 */
+diff --git a/drivers/mailbox/msm_qmp.c b/drivers/mailbox/msm_qmp.c
+index 726f65677b..36a304d88c 100644
+--- a/drivers/mailbox/msm_qmp.c
++++ b/drivers/mailbox/msm_qmp.c
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/io.h>
+ #include <linux/interrupt.h>
++#include <linux/delay.h>
+ #include <linux/types.h>
+ #include <linux/spinlock.h>
+ #include <linux/completion.h>
+@@ -33,6 +34,13 @@
+ #define MSG_RAM_ALIGN_BYTES 3
+ 
+ #define QMP_IPC_LOG_PAGE_CNT 2
++
++/* Force a DOWN->UP QMP edge when inheriting live AOP state across kexec. */
++static bool qkx_qmp_rehandshake;
++core_param(qkx_qmp_rehandshake, qkx_qmp_rehandshake, bool, 0444);
++static bool qkx_qmp_adopt;
++core_param(qkx_qmp_adopt, qkx_qmp_adopt, bool, 0444);
++bool qkx_qmp_inherited_ready;
+ #define QMP_INFO(ctxt, x, ...)						  \
+ do {									  \
+ 	if (ctxt)							  \
+@@ -162,6 +170,7 @@ struct qmp_mbox {
+ 	struct completion ch_complete;
+ 	struct delayed_work dwork;
+ 	struct qmp_device *mdev;
++	bool qkx_adopted;
+ };
+ 
+ /**
+@@ -347,6 +356,20 @@ static int qmp_startup(struct mbox_chan *chan)
+ 		set_mcore_ch(mbox, QMP_MBOX_CH_CONNECTED);
+ 		mbox->local_state = LOCAL_CONNECTING;
+ 		send_irq(mbox->mdev);
++		if (mbox->qkx_adopted) {
++			struct mbox_desc desc;
++
++			memcpy_fromio(&desc, mbox->desc, sizeof(desc));
++			if (desc.ucore.ch_state == QMP_MBOX_CH_CONNECTED &&
++			    desc.ucore.ch_state_ack == QMP_MBOX_CH_CONNECTED &&
++			    desc.mcore.ch_state == QMP_MBOX_CH_CONNECTED &&
++			    desc.mcore.ch_state_ack == QMP_MBOX_CH_CONNECTED) {
++				mbox->local_state = CHANNEL_CONNECTED;
++				complete_all(&mbox->ch_complete);
++				pr_emerg("qkxqmp: %s adopted connected channel\n",
++					 mbox->mdev->name);
++			}
++		}
+ 	}
+ 	mutex_unlock(&mbox->state_lock);
+ 
+@@ -510,6 +533,24 @@ static void init_mcore_state(struct qmp_mbox *mbox)
+ 	memcpy32_toio(mbox->desc + offset, &mcore, sizeof(mcore));
+ }
+ 
++static void qkx_reset_mcore_state(struct qmp_mbox *mbox)
++{
++	struct channel_desc mcore = {
++		.link_state = QMP_MBOX_LINK_DOWN,
++		.link_state_ack = QMP_MBOX_LINK_DOWN,
++		.ch_state = QMP_MBOX_CH_DISCONNECTED,
++		.ch_state_ack = QMP_MBOX_CH_DISCONNECTED,
++		.mailbox_size = mbox->mcore_mbox_size,
++		.mailbox_offset = mbox->mcore_mbox_offset,
++	};
++	u32 offset = offsetof(struct mbox_desc, mcore);
++
++	memcpy32_toio(mbox->desc + offset, &mcore, sizeof(mcore));
++	mbox->local_state = LINK_DISCONNECTED;
++	reinit_completion(&mbox->link_complete);
++	reinit_completion(&mbox->ch_complete);
++}
++
+ /**
+  * qmp_irq_handler() - handle irq from remote entitity.
+  * @irq:	irq number for the trggered interrupt.
+@@ -568,7 +609,12 @@ static void __qmp_rx_worker(struct qmp_mbox *mbox)
+ 	case LINK_NEGOTIATION:
+ 		if (desc.mcore.link_state_ack != QMP_MBOX_LINK_UP ||
+ 				desc.mcore.link_state != QMP_MBOX_LINK_UP) {
+-			QMP_ERR(mdev->ilc, "RX int without negotiation ack\n");
++			QMP_ERR(mdev->ilc,
++				"RX without ack: ulink=%08x uack=%08x uch=%08x ucack=%08x mlink=%08x mack=%08x mch=%08x mcack=%08x\n",
++				desc.ucore.link_state, desc.ucore.link_state_ack,
++				desc.ucore.ch_state, desc.ucore.ch_state_ack,
++				desc.mcore.link_state, desc.mcore.link_state_ack,
++				desc.mcore.ch_state, desc.mcore.ch_state_ack);
+ 			break;
+ 		}
+ 		mbox->local_state = LINK_CONNECTED;
+@@ -991,6 +1037,90 @@ static int qmp_mbox_probe(struct platform_device *pdev)
+ 		QMP_ERR(mdev->ilc, "enable_irq_wake on %d failed: %d\n",
+ 			mdev->rx_irq_line, ret);
+ 
++	if (qkx_qmp_adopt) {
++		struct qmp_mbox *mbox;
++
++		list_for_each_entry(mbox, &mdev->mboxes, list) {
++			struct mbox_desc desc;
++			unsigned int wait;
++
++			memcpy_fromio(&desc, mbox->desc, sizeof(desc));
++			if (desc.magic == QMP_MAGIC &&
++			    desc.ucore.link_state == QMP_MBOX_LINK_UP &&
++			    desc.ucore.link_state_ack == QMP_MBOX_LINK_UP &&
++			    desc.mcore.link_state == QMP_MBOX_LINK_UP &&
++			    desc.mcore.link_state_ack == QMP_MBOX_LINK_UP) {
++				/* Normal LINK_DISCONNECTED negotiation imports these
++				 * values before publishing mcore state. Adoption bypasses
++				 * that branch, so import them from the inherited descriptor.
++				 */
++				mbox->version.version = desc.version;
++				mbox->version.features = desc.features;
++				if (desc.mcore.mailbox_size) {
++					mbox->mcore_mbox_size = desc.mcore.mailbox_size;
++					mbox->mcore_mbox_offset = desc.mcore.mailbox_offset;
++				}
++				if (!mbox->rx_pkt.data && desc.ucore.mailbox_size)
++					mbox->rx_pkt.data = devm_kzalloc(mdev->dev,
++						desc.ucore.mailbox_size, GFP_KERNEL);
++				if (!mbox->rx_pkt.data) {
++					pr_emerg("qkxqmp: %s failed inherited RX allocation\n",
++						 mdev->name);
++					continue;
++				}
++				/* Preserve the live AOP link, but close the inherited
++				 * logical channel so the normal startup path creates a
++				 * fresh channel transaction context for this kernel.
++				 */
++				disable_irq(mdev->rx_irq_line);
++				set_mcore_ch(mbox, QMP_MBOX_CH_DISCONNECTED);
++				/* Android may die with an outstanding nonzero mailbox
++				 * length. AOP detects a new packet on zero -> nonzero;
++				 * clear it while the inherited channel is closed.
++				 */
++				iowrite32(0, mbox->desc + mbox->mcore_mbox_offset);
++				mbox->tx_sent = false;
++				send_irq(mdev);
++				for (wait = 0; wait < 100; wait++) {
++					if (ioread32(mbox->desc +
++					    offsetof(struct mbox_desc,
++						     mcore.ch_state_ack)) ==
++					    QMP_MBOX_CH_DISCONNECTED)
++						break;
++					usleep_range(1000, 2000);
++				}
++				enable_irq(mdev->rx_irq_line);
++				if (wait == 100) {
++					pr_emerg("qkxqmp: %s inherited channel close timed out\n",
++						 mdev->name);
++					continue;
++				}
++				mbox->local_state = LINK_CONNECTED;
++				mbox->qkx_adopted = false;
++				qkx_qmp_inherited_ready = true;
++				complete_all(&mbox->link_complete);
++				pr_emerg("qkxqmp: %s adopted link and closed inherited channel\n",
++					 mdev->name);
++			}
++		}
++	}
++
++	if (qkx_qmp_rehandshake) {
++		struct qmp_mbox *mbox;
++
++		/* Android leaves the AP half LINK_UP. Writing UP again creates no
++		 * edge for the still-running AOP. Keep RX masked so a stale/pending
++		 * interrupt cannot make our worker overwrite DOWN before AOP sees it.
++		 */
++		disable_irq(mdev->rx_irq_line);
++		list_for_each_entry(mbox, &mdev->mboxes, list)
++			qkx_reset_mcore_state(mbox);
++		pr_emerg("qkxqmp: %s forced mcore link down\n", mdev->name);
++		send_irq(mdev);
++		msleep(20);
++		enable_irq(mdev->rx_irq_line);
++	}
++
+ 	/* Trigger fake RX in case of missed interrupt */
+ 	if (of_property_read_bool(edge_node, "qcom,early-boot"))
+ 		qmp_irq_handler(0, mdev);
+diff --git a/drivers/misc/qseecom.c b/drivers/misc/qseecom.c
+index 6b5d739a4d..e8819ccdc1 100644
+--- a/drivers/misc/qseecom.c
++++ b/drivers/misc/qseecom.c
+@@ -1762,7 +1762,9 @@ static int __qseecom_unregister_listener_kthread_func(void *data)
+ 		wait_event_interruptible(
+ 			qseecom.unregister_lsnr_kthread_wq,
+ 			atomic_read(&qseecom.unregister_lsnr_kthread_state)
+-				== LSNR_UNREG_KT_WAKEUP);
++				== LSNR_UNREG_KT_WAKEUP || kthread_should_stop());
++		if (kthread_should_stop())
++			break;
+ 		pr_debug("kthread to unregister listener is called %d\n",
+ 			atomic_read(&qseecom.unregister_lsnr_kthread_state));
+ 		__qseecom_processing_pending_lsnr_unregister();
+@@ -3268,7 +3270,9 @@ static int __qseecom_unload_app_kthread_func(void *data)
+ 		wait_event_interruptible(
+ 			qseecom.unload_app_kthread_wq,
+ 			atomic_read(&qseecom.unload_app_kthread_state)
+-				== UNLOAD_APP_KT_WAKEUP);
++				== UNLOAD_APP_KT_WAKEUP || kthread_should_stop());
++		if (kthread_should_stop())
++			break;
+ 		pr_debug("kthread to unload app is called, state %d\n",
+ 			atomic_read(&qseecom.unload_app_kthread_state));
+ 		__qseecom_processing_pending_unload_app();
+diff --git a/drivers/of/device.c b/drivers/of/device.c
+index 65235ff63c..c92512b688 100644
+--- a/drivers/of/device.c
++++ b/drivers/of/device.c
+@@ -160,8 +160,21 @@ int of_dma_configure(struct device *dev, struct device_node *np, bool force_dma)
+ 		coherent ? " " : " not ");
+ 
+ 	iommu = of_iommu_configure(dev, np);
+-	if (IS_ERR(iommu) && PTR_ERR(iommu) == -EPROBE_DEFER)
+-		return -EPROBE_DEFER;
++	if (IS_ERR(iommu) && PTR_ERR(iommu) == -EPROBE_DEFER) {
++		/* qkx: after kexec the apps-smmu never claims the platform bus
++		 * (its probe defers permanently and deferred retries are
++		 * disabled), which parks the dwc3-msm glue in dma_configure
++		 * forever. The glue's iommu_map is unused and gadget DMA works
++		 * through the sysdev with direct DMA/swiotlb, so continue
++		 * without an iommu for this node only. */
++		if (of_device_is_compatible(np, "qcom,dwc-usb3-msm")) {
++			dev_info(dev,
++				 "qkx: iommu defer; continuing without iommu\n");
++			iommu = NULL;
++		} else {
++			return -EPROBE_DEFER;
++		}
++	}
+ 
+ 	dev_dbg(dev, "device is%sbehind an iommu\n",
+ 		iommu ? " " : " not ");
+diff --git a/drivers/power/reset/msm-poweroff.c b/drivers/power/reset/msm-poweroff.c
+index 13121cea46..0afe617363 100644
+--- a/drivers/power/reset/msm-poweroff.c
++++ b/drivers/power/reset/msm-poweroff.c
+@@ -56,6 +56,8 @@ static bool scm_deassert_ps_hold_supported;
+ static void __iomem *msm_ps_hold;
+ static phys_addr_t tcsr_boot_misc_detect;
+ static void scm_disable_sdi(void);
++static void halt_spmi_pmic_arbiter(void);
++static void deassert_ps_hold(void);
+ 
+ /*
+  * Runtime could be only changed value once.
+@@ -72,8 +74,33 @@ static bool dload_mode_enabled;
+ static void *emergency_dload_mode_addr;
+ static bool scm_dload_supported;
+ 
++/* Quest kexec diagnostics retain the reserved RAM log across checkpoints. */
+ static bool force_warm_reboot;
+ 
++void qkx_force_warm_reboot(void)
++{
++	force_warm_reboot = true;
++}
++
++/*
++ * Minimal, lock-free warm reset path.  Safe to invoke from a secondary
++ * CPU while the boot CPU is hung inside an initcall with interrupts
++ * disabled: it touches no notifier lists, no device locks, and performs
++ * no cross-CPU synchronization.  The PS_HOLD drop is a direct register
++ * write so the reset cannot be lost inside a wedged SCM call.
++ */
++void qkx_minimal_warm_reset(void)
++{
++	qpnp_pon_system_pwr_off(PON_POWER_OFF_WARM_RESET);
++	flush_cache_all();
++	scm_disable_sdi();
++	if (msm_ps_hold)
++		__raw_writel(0, msm_ps_hold);
++	for (;;)
++		mdelay(1000);
++}
++EXPORT_SYMBOL(qkx_minimal_warm_reset);
++
+ /* interface for exporting attributes */
+ struct reset_attribute {
+ 	struct attribute        attr;
+diff --git a/drivers/soc/qcom/msm_bus/msm_bus_fabric_rpmh.c b/drivers/soc/qcom/msm_bus/msm_bus_fabric_rpmh.c
+index 3a48c03a8b..658464c5fc 100644
+--- a/drivers/soc/qcom/msm_bus/msm_bus_fabric_rpmh.c
++++ b/drivers/soc/qcom/msm_bus/msm_bus_fabric_rpmh.c
+@@ -39,6 +39,45 @@
+ 	((vote_y & BCM_TCS_CMD_VOTE_MASK) << BCM_TCS_CMD_VOTE_Y_SHFT))
+ 
+ static int msm_bus_dev_init_qos(struct device *dev, void *data);
++
++/*
++ * qkx: init_qos bisection. qkx_bus_qos_skip bits: 1 skip BCM votes,
++ * 2 skip QoS clocks, 4 skip QoS MMIO programming. qkx_bus_qos_max limits
++ * how many nodes get the full sequence (-1 = unlimited); later nodes are
++ * treated as bypass_qos_prg.
++ */
++static int qkx_bus_qos_skip;
++core_param(qkx_bus_qos_skip, qkx_bus_qos_skip, int, 0444);
++static int qkx_bus_qos_max = -1;
++core_param(qkx_bus_qos_max, qkx_bus_qos_max, int, 0444);
++static int qkx_bus_qos_count;
++/*
++ * Comma-separated node ids whose QoS programming is skipped.
++ *
++ * Default 122 (mas-xm-ufs-card): Quest Pro has no UFS card. On a cold boot
++ * the bootloader leaves that aggre2_noc port clocked, so the early QoS write
++ * is harmless; after kexec the previous kernel's clk_disable_unused has
++ * gated it, and the unclocked NoC QoS write hard-resets the SoC (PMIC cold
++ * reset). Unlike usb3/ufs-mem, the DT gives this port no qos clock to enable
++ * first, so skip it.
++ */
++static char *qkx_bus_qos_skipids = "122";
++core_param(qkx_bus_qos_skipids, qkx_bus_qos_skipids, charp, 0444);
++
++static bool qkx_bus_qos_skipped(int id)
++{
++	const char *p = qkx_bus_qos_skipids;
++	int v;
++
++	while (p && *p) {
++		if (sscanf(p, "%d", &v) == 1 && v == id)
++			return true;
++		p = strchr(p, ',');
++		if (p)
++			p++;
++	}
++	return false;
++}
+ static int msm_bus_dev_sbm_config(struct device *dev, bool enable);
+ 
+ static struct list_head bcm_query_list_inorder[VCD_MAX_CNT];
+@@ -629,7 +668,9 @@ int msm_bus_commit_data(struct list_head *clist)
+ 	tcs_cmd_n_shrink(n_wake);
+ 	tcs_cmd_n_shrink(n_sleep);
+ 
++	pr_emerg("qkxbus: commit rsc invalidate\n");
+ 	ret = rpmh_invalidate(cur_mbox);
++	pr_emerg("qkxbus: commit invalidate ret=%d\n", ret);
+ 	if (ret)
+ 		MSM_BUS_ERR("%s: Error invalidating mbox: %d\n",
+ 						__func__, ret);
+@@ -668,6 +709,8 @@ int msm_bus_commit_data(struct list_head *clist)
+ 							__func__, ret);
+ 	}
+ 
++	pr_emerg("qkxbus: commit rsc=%d writes done ret=%d n=%d\n",
++		 cur_rsc->node_info->id, ret, n_active[0]);
+ 	list_for_each_entry_safe(node, node_tmp, clist, link) {
+ 		if (unlikely(node->node_info->defer_qos))
+ 			msm_bus_dev_init_qos(&node->dev, NULL);
+@@ -988,9 +1031,26 @@ static int msm_bus_dev_init_qos(struct device *dev, void *data)
+ 			if (node_dev->ap_owned) {
+ 				if (bus_node_info->fabdev->bypass_qos_prg)
+ 					goto exit_init_qos;
++				if (qkx_bus_qos_max >= 0 &&
++				    qkx_bus_qos_count >= qkx_bus_qos_max)
++					goto exit_init_qos;
++				qkx_bus_qos_count++;
++				if (qkx_bus_qos_skipped(node_dev->node_info->id)) {
++					pr_emerg("qkxbus: qos node %d skipped\n",
++						 node_dev->node_info->id);
++					goto exit_init_qos;
++				}
+ 
+-				ret = msm_bus_vote_qos_bcms(node_dev);
+-				ret = msm_bus_enable_node_qos_clk(node_dev);
++				pr_emerg("qkxbus: qos #%d node %d vote\n",
++					 qkx_bus_qos_count,
++					 node_dev->node_info->id);
++				ret = 0;
++				if (!(qkx_bus_qos_skip & 1))
++					ret = msm_bus_vote_qos_bcms(node_dev);
++				pr_emerg("qkxbus: qos node %d vote ret=%d clk\n",
++					 node_dev->node_info->id, ret);
++				if (!(qkx_bus_qos_skip & 2))
++					ret = msm_bus_enable_node_qos_clk(node_dev);
+ 				if (ret < 0) {
+ 					MSM_BUS_DBG("Can't Enable QoS clk %d\n",
+ 					node_dev->node_info->id);
+@@ -998,14 +1058,24 @@ static int msm_bus_dev_init_qos(struct device *dev, void *data)
+ 					goto exit_init_qos;
+ 				}
+ 
+-				bus_node_info->fabdev->noc_ops.qos_init(
++				pr_emerg("qkxbus: qos node %d mmio base=%pK off=%x qoff=%x\n",
++					 node_dev->node_info->id,
++					 bus_node_info->fabdev->qos_base,
++					 bus_node_info->fabdev->base_offset,
++					 bus_node_info->fabdev->qos_off);
++				if (!(qkx_bus_qos_skip & 4))
++					bus_node_info->fabdev->noc_ops.qos_init(
+ 					node_dev,
+ 					bus_node_info->fabdev->qos_base,
+ 					bus_node_info->fabdev->base_offset,
+ 					bus_node_info->fabdev->qos_off,
+ 					bus_node_info->fabdev->qos_freq);
+-				ret = msm_bus_disable_node_qos_clk(node_dev);
+-				ret = msm_bus_rm_vote_qos_bcms(node_dev);
++				pr_emerg("qkxbus: qos node %d mmio done\n",
++					 node_dev->node_info->id);
++				if (!(qkx_bus_qos_skip & 2))
++					ret = msm_bus_disable_node_qos_clk(node_dev);
++				if (!(qkx_bus_qos_skip & 1))
++					ret = msm_bus_rm_vote_qos_bcms(node_dev);
+ 				node_dev->node_info->defer_qos = false;
+ 			}
+ 		} else
+@@ -1797,12 +1867,31 @@ int msm_bus_device_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++/*
++ * qkx: bisection aid for the post-kexec hard reset triggered by this probe.
++ * qkx_bus_stop=N makes the probe return early at phase N:
++ *   1 probe entry, 2 after node/clk init, 3 after dev_conn/postcon,
++ *   4 after init_qos (skips late_init commit); 0 runs everything.
++ */
++static int qkx_bus_stop;
++core_param(qkx_bus_stop, qkx_bus_stop, int, 0444);
++static bool qkx_bus_probed;
++
++#define QKX_BUS_STOP(n) do {						\
++	pr_emerg("qkxbus: phase %d reached\n", n);			\
++	if (qkx_bus_stop == (n)) {					\
++		pr_emerg("qkxbus: stopping at phase %d\n", n);		\
++		return -ENODEV;						\
++	}								\
++} while (0)
++
+ static int msm_bus_device_probe(struct platform_device *pdev)
+ {
+ 	unsigned int i = 1, ret;
+ 	struct msm_bus_device_node_registration *pdata;
+ 
+ 	MSM_BUS_ERR("msm_bus: Probe started");
++	QKX_BUS_STOP(1);
+ 	/* If possible, get pdata from device-tree */
+ 	if (pdev->dev.of_node)
+ 		pdata = msm_bus_of_to_pdata(pdev);
+@@ -1866,6 +1955,8 @@ static int msm_bus_device_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	QKX_BUS_STOP(2);
++	pr_emerg("qkxbus: phase dev_conn (%d nodes)\n", pdata->num_devices);
+ 	ret = bus_for_each_dev(&msm_bus_type, NULL, NULL,
+ 						msm_bus_setup_dev_conn);
+ 	if (ret) {
+@@ -1873,6 +1964,7 @@ static int msm_bus_device_probe(struct platform_device *pdev)
+ 		goto exit_device_probe;
+ 	}
+ 
++	pr_emerg("qkxbus: phase postcon\n");
+ 	ret = bus_for_each_dev(&msm_bus_type, NULL, NULL,
+ 						msm_bus_postcon_setup);
+ 	if (ret) {
+@@ -1885,7 +1977,13 @@ static int msm_bus_device_probe(struct platform_device *pdev)
+ 	 * defer QoS programming to the first transaction in cases of failure
+ 	 * and we want to continue the probe.
+ 	 */
++	QKX_BUS_STOP(3);
++	pr_emerg("qkxbus: phase init_qos\n");
+ 	ret = bus_for_each_dev(&msm_bus_type, NULL, NULL, msm_bus_dev_init_qos);
++	pr_emerg("qkxbus: phase init_qos done (%d nodes programmed)\n",
++		 qkx_bus_qos_count);
++	QKX_BUS_STOP(4);
++	qkx_bus_probed = true;
+ 
+ 	/* Register the arb layer ops */
+ 	msm_bus_arb_setops_adhoc(&arb_ops);
+@@ -2035,6 +2133,11 @@ int __init msm_bus_device_init_driver(void)
+ 
+ int __init msm_bus_device_late_init(void)
+ {
++	if (!qkx_bus_probed) {
++		pr_emerg("qkxbus: probe incomplete; skipping late_init commit\n");
++		return 0;
++	}
++	pr_emerg("qkxbus: late_init commit\n");
+ 	commit_late_init_data(true);
+ 	MSM_BUS_ERR("msm_bus_late_init: Remove handoff bw requests\n");
+ 	init_time = false;
+diff --git a/drivers/soc/qcom/msm_bus/msm_bus_proxy_client.c b/drivers/soc/qcom/msm_bus/msm_bus_proxy_client.c
+index d3ca18fcbe..56de67fcb6 100644
+--- a/drivers/soc/qcom/msm_bus/msm_bus_proxy_client.c
++++ b/drivers/soc/qcom/msm_bus/msm_bus_proxy_client.c
+@@ -81,5 +81,9 @@ static int __init msm_bus_proxy_client_unvote(void)
+ 	return 0;
+ }
+ 
+-subsys_initcall_sync(msm_bus_proxy_client_init_driver);
+-late_initcall_sync(msm_bus_proxy_client_unvote);
++/* Quest kexec: the RPMh bus fabric is deliberately disabled, so registering
++ * its proxy client would block forever. The diagnostic environment does not
++ * need bus bandwidth votes.
++ */
++/* subsys_initcall_sync(msm_bus_proxy_client_init_driver); */
++/* late_initcall_sync(msm_bus_proxy_client_unvote); */
+diff --git a/drivers/usb/dwc3/dwc3-msm.c b/drivers/usb/dwc3/dwc3-msm.c
+index fb9eafcb8b..ea90f09454 100644
+--- a/drivers/usb/dwc3/dwc3-msm.c
++++ b/drivers/usb/dwc3/dwc3-msm.c
+@@ -3716,6 +3716,7 @@ static int dwc_dpdm_cb(struct notifier_block *nb, unsigned long evt, void *p)
+ static int dwc3_msm_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *node = pdev->dev.of_node, *dwc3_node;
++	struct device_node *child = NULL;
+ 	struct device	*dev = &pdev->dev;
+ 	struct dwc3_msm *mdwc;
+ 	struct dwc3	*dwc;
+@@ -3727,6 +3728,8 @@ static int dwc3_msm_probe(struct platform_device *pdev)
+ 	if (!mdwc)
+ 		return -ENOMEM;
+ 
++	dev_info(&pdev->dev, "qkx: dwc3_msm_probe enter\n");
++
+ 	platform_set_drvdata(pdev, mdwc);
+ 	mdwc->dev = &pdev->dev;
+ 
+@@ -3759,7 +3762,7 @@ static int dwc3_msm_probe(struct platform_device *pdev)
+ 	/* Get all clks and gdsc reference */
+ 	ret = dwc3_msm_get_clk_gdsc(mdwc);
+ 	if (ret) {
+-		dev_err(&pdev->dev, "error getting clock or gdsc.\n");
++		dev_err(&pdev->dev, "error getting clock or gdsc. ret=%d\n", ret);
+ 		goto err;
+ 	}
+ 
+@@ -3916,8 +3919,16 @@ static int dwc3_msm_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
+-	/* Assumes dwc3 is the first DT child of dwc3-msm */
+-	dwc3_node = of_get_next_available_child(node, NULL);
++	/* Assumes dwc3 is the first DT child of dwc3-msm. qkx: the captured
++	 * runtime DTB lists qcom,usbbam before dwc3, so look the dwc3 child
++	 * up by compatible instead of blindly taking the first child. */
++	dwc3_node = NULL;
++	for_each_available_child_of_node(node, child) {
++		if (of_device_is_compatible(child, "snps,dwc3")) {
++			dwc3_node = child;
++			break;
++		}
++	}
+ 	if (!dwc3_node) {
+ 		dev_err(&pdev->dev, "failed to find dwc3 child\n");
+ 		ret = -ENODEV;
+@@ -4027,7 +4038,16 @@ static int dwc3_msm_probe(struct platform_device *pdev)
+ 
+ 	if (of_property_read_bool(node, "extcon")) {
+ 		ret = dwc3_msm_extcon_register(mdwc);
+-		if (ret)
++		if (ret == -EPROBE_DEFER) {
++			/* qkx: the pdphy extcon provider never comes up after
++		 * kexec, so deferring here parks USB forever (deferred
++		 * retries are disabled in the diagnostic kernel). Mirror
++		 * the no-extcon DRD default and start peripheral mode. */
++			dev_info(mdwc->dev,
++				 "qkx: extcon defer; starting peripheral mode\n");
++			mdwc->vbus_active = true;
++			dwc3_ext_event_notify(mdwc);
++		} else if (ret)
+ 			goto put_dwc3;
+ 
+ 		/*
+@@ -4984,7 +5004,10 @@ MODULE_DESCRIPTION("DesignWare USB3 MSM Glue Layer");
+ 
+ static int dwc3_msm_init(void)
+ {
+-	return platform_driver_register(&dwc3_msm_driver);
++	int ret = platform_driver_register(&dwc3_msm_driver);
++
++	pr_info("qkx: dwc3_msm_init platform_driver_register=%d\n", ret);
++	return ret;
+ }
+ module_init(dwc3_msm_init);
+ 
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index fb1bdcd358..cffabd63bc 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -22,6 +22,7 @@
+ #include <linux/usb/ch9.h>
+ #include <linux/usb/composite.h>
+ #include <linux/usb/gadget.h>
++#include <linux/pm_runtime.h>
+ 
+ #include "debug.h"
+ #include "core.h"
+@@ -2493,12 +2494,18 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
+ 		 * the udc_start.
+ 		 */
+ 		spin_unlock_irqrestore(&dwc->lock, flags);
++		dev_info(dwc->dev,
++			 "qkx: pullup(%d) deferred: vbus_active=%d driver=%d err=%d\n",
++			 is_on, dwc->vbus_active, !!dwc->gadget_driver,
++			 dwc->err_evt_seen);
+ 		dbg_event(0xFF, "WaitPullup", 0);
+ 		return 0;
+ 	}
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
++	dev_info(dwc->dev, "qkx: pullup(%d) proceeding\n", is_on);
+ 	pm_runtime_get_sync(dwc->dev);
++	dev_info(dwc->dev, "qkx: pullup pm_runtime_get_sync done\n");
+ 	dbg_event(0xFF, "Pullup gsync",
+ 		atomic_read(&dwc->dev->power.usage_count));
+ 
+@@ -2553,6 +2560,8 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
+ 
+ 	ret = dwc3_gadget_run_stop_util(dwc);
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
++	dev_info(dwc->dev, "qkx: pullup run_stop_util ret=%d gadget_state=%d\n",
++		 ret, dwc->gadget_state);
+ 	if (!is_on && ret == -ETIMEDOUT) {
+ 		/*
+ 		 * If we fail to stop the controller then mark it as an error
+@@ -2574,6 +2583,67 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
+ 	return ret;
+ }
+ 
++/* qkx: post-bind USB state dump — decodes whether the core ever saw the
++ * host's bus reset (DSTS DCNN/connect + SSTS speed) and whether the event
++ * machinery produced anything (GEVNTCOUNT), plus GIC line state via the
++ * irqchip API (no raw MMIO).
++ */
++static void qkx_usb_dump_regs(struct dwc3 *dwc, const char *tag)
++{
++	bool pend = false, act = false;
++	struct device *p = dwc->dev->parent;
++	bool susp = pm_runtime_suspended(dwc->dev);
++	bool psusp = p ? pm_runtime_suspended(p) : false;
++
++	irq_get_irqchip_state(dwc->irq, IRQCHIP_STATE_PENDING, &pend);
++	irq_get_irqchip_state(dwc->irq, IRQCHIP_STATE_ACTIVE, &act);
++	dev_info(dwc->dev,
++		 "qkx: %s: pm(core susp=%d use=%d parent susp=%d use=%d) in_lpm=%d gic(pend=%d act=%d)\n",
++		 tag, susp,
++		 atomic_read(&dwc->dev->power.usage_count), psusp,
++		 p ? atomic_read(&p->power.usage_count) : -1,
++		 atomic_read(&dwc->in_lpm), pend, act);
++
++	/* read-only: no pm_runtime_get_sync here — resuming would CSFTRST and
++	 * re-init the core, perturbing the very state under observation. */
++	if (!susp && !psusp) {
++		u32 dctl, dsts, devten, evsiz, evcnt;
++
++		dctl = dwc3_readl(dwc->regs, DWC3_DCTL);
++		dsts = dwc3_readl(dwc->regs, DWC3_DSTS);
++		devten = dwc3_readl(dwc->regs, DWC3_DEVTEN);
++		evsiz = dwc3_readl(dwc->regs, DWC3_GEVNTSIZ(0));
++		evcnt = dwc3_readl(dwc->regs, DWC3_GEVNTCOUNT(0));
++		dev_info(dwc->dev,
++			 "qkx: %s: GSNPSID=%08x GCTL=%08x DCTL=%08x DSTS=%08x (spd=%d link=%d) DEVTEN=%08x EVSIZ=%08x EVCNT=%08x\n",
++			 tag, dwc3_readl(dwc->regs, DWC3_GSNPSID),
++			 dwc3_readl(dwc->regs, DWC3_GCTL), dctl, dsts,
++			 dsts & DWC3_DSTS_CONNECTSPD,
++			 (dsts & DWC3_DSTS_USBLNKST_MASK) >> 18, devten,
++			 evsiz, evcnt);
++	} else {
++		dev_info(dwc->dev, "qkx: %s: skipping MMIO reads (runtime suspended)\n",
++			 tag);
++	}
++}
++
++static void qkx_usb_dump_work(struct work_struct *w);
++static DECLARE_DELAYED_WORK(qkx_usb_dump_work_w, qkx_usb_dump_work);
++static struct dwc3 *qkx_dump_dwc;
++static int qkx_dump_rounds;
++
++static void qkx_usb_dump_work(struct work_struct *w)
++{
++	struct dwc3 *dwc = qkx_dump_dwc;
++
++	if (!dwc)
++		return;
++	qkx_usb_dump_regs(dwc, "post-bind dump");
++	if (++qkx_dump_rounds < 4)
++		schedule_delayed_work(&qkx_usb_dump_work_w,
++				msecs_to_jiffies(3000));
++}
++
+ static void dwc3_gadget_enable_irq(struct dwc3 *dwc)
+ {
+ 	u32			reg;
+@@ -2668,6 +2738,9 @@ static int dwc3_gadget_vbus_session(struct usb_gadget *_gadget, int is_active)
+ 
+ 	dbg_event(0xFF, "VbusSess", is_active);
+ 
++	dev_info(dwc->dev, "qkx: vbus_session(%d) enter vbus_active=%d state=%d\n",
++		 is_active, dwc->vbus_active, dwc->gadget_state);
++
+ 	disable_irq(dwc->irq);
+ 
+ 	flush_work(&dwc->bh_work);
+@@ -2774,6 +2847,21 @@ static int __dwc3_gadget_start(struct dwc3 *dwc)
+ 
+ 	dwc3_gadget_enable_irq(dwc);
+ 
++	dev_info(dwc->dev,
++		 "qkx: gadget_start done: DEVTEN=%08x irq=%d hwirq=untouched\n",
++		 dwc3_readl(dwc->regs, DWC3_DEVTEN), dwc->irq);
++
++	/* qkx: pin the dwc3 core child awake while the gadget driver is
++	 * bound. Runtime-PM autosuspend parks the core ~1s after bind,
++	 * killing the gadget mid-enumeration (host sees chirp then -110). */
++	pm_runtime_get_noresume(dwc->dev);
++	dev_info(dwc->dev, "qkx: core pinned awake (use=%d)\n",
++		 atomic_read(&dwc->dev->power.usage_count));
++
++	qkx_dump_dwc = dwc;
++	qkx_dump_rounds = 0;
++	schedule_delayed_work(&qkx_usb_dump_work_w, msecs_to_jiffies(2000));
++
+ 	return 0;
+ 
+ err1:
+@@ -2834,6 +2922,9 @@ static int dwc3_gadget_stop(struct usb_gadget *g)
+ 	dwc->gadget_driver	= NULL;
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
++	/* qkx: release the gadget_start pin */
++	pm_runtime_put_noidle(dwc->dev);
++
+ 	dbg_event(0xFF, "fwq_started", 0);
+ 	flush_workqueue(dwc->dwc_wq);
+ 	dbg_event(0xFF, "fwq_completed", 0);
+diff --git a/drivers/usb/phy/phy-msm-ssusb-qmp.c b/drivers/usb/phy/phy-msm-ssusb-qmp.c
+index 33a47180c2..2d0ed6bda6 100644
+--- a/drivers/usb/phy/phy-msm-ssusb-qmp.c
++++ b/drivers/usb/phy/phy-msm-ssusb-qmp.c
+@@ -784,6 +784,14 @@ static int msm_ssphy_qmp_extcon_register(struct msm_ssphy_qmp *phy,
+ 
+ 	edev = extcon_get_edev_by_phandle(dev, 0);
+ 	if (IS_ERR(edev)) {
++		/* qkx: the pdphy extcon provider never registers after kexec
++		 * (its usb/dc power supplies stay absent). Continue without the
++		 * DP extcon so the PHY still binds; matches the non-DP PHY state. */
++		if (PTR_ERR(edev) == -EPROBE_DEFER) {
++			dev_info(dev,
++				 "qkx: extcon deferring; continuing without extcon\n");
++			return 0;
++		}
+ 		dev_err(dev, "failed to get phandle for msm_ssphy_qmp\n");
+ 		return PTR_ERR(edev);
+ 	}
+diff --git a/drivers/usb/phy/phy.c b/drivers/usb/phy/phy.c
+index 25b20539e0..6054c8af92 100644
+--- a/drivers/usb/phy/phy.c
++++ b/drivers/usb/phy/phy.c
+@@ -53,8 +53,10 @@ static struct usb_phy *__of_usb_find_phy(struct device_node *node)
+ {
+ 	struct usb_phy  *phy;
+ 
+-	if (!of_device_is_available(node))
++	if (!of_device_is_available(node)) {
++		pr_info("qkx: find_phy: node %pOF not available\n", node);
+ 		return ERR_PTR(-ENODEV);
++	}
+ 
+ 	list_for_each_entry(phy, &phy_list, head) {
+ 		if (node != phy->dev->of_node)
+@@ -63,6 +65,10 @@ static struct usb_phy *__of_usb_find_phy(struct device_node *node)
+ 		return phy;
+ 	}
+ 
++	list_for_each_entry(phy, &phy_list, head)
++		pr_info("qkx: find_phy: want %pOF; list has %s node %pOF\n",
++			node, dev_name(phy->dev), phy->dev->of_node);
++
+ 	return ERR_PTR(-EPROBE_DEFER);
+ }
+ 
+@@ -318,8 +324,17 @@ static int usb_add_extcon(struct usb_phy *x)
+ 
+ 	if (of_property_read_bool(x->dev->of_node, "extcon")) {
+ 		x->edev = extcon_get_edev_by_phandle(x->dev, 0);
+-		if (IS_ERR(x->edev))
++		if (IS_ERR(x->edev)) {
++			/* qkx: after kexec the pdphy extcon provider never
++			 * appears; register the PHY without extcon support. */
++			if (PTR_ERR(x->edev) == -EPROBE_DEFER) {
++				dev_info(x->dev,
++					 "qkx: extcon defer; phy without extcon\n");
++				x->edev = NULL;
++				goto no_extcon;
++			}
+ 			return PTR_ERR(x->edev);
++		}
+ 
+ 		x->id_edev = extcon_get_edev_by_phandle(x->dev, 1);
+ 		if (IS_ERR(x->id_edev)) {
+@@ -395,6 +410,7 @@ static int usb_add_extcon(struct usb_phy *x)
+ 		}
+ 	}
+ 
++no_extcon:
+ 	if (x->type_nb.notifier_call)
+ 		__usb_phy_get_charger_type(x);
+ 
+@@ -555,6 +571,8 @@ struct usb_phy *devm_usb_get_phy_by_phandle(struct device *dev,
+ 
+ 	node = of_parse_phandle(dev->of_node, phandle, index);
+ 	if (!node) {
++		dev_info(dev, "qkx: get_phy: phandle %s idx %u missing in %pOF\n",
++			 phandle, index, dev->of_node);
+ 		dev_dbg(dev, "failed to get %s phandle in %pOF node\n", phandle,
+ 			dev->of_node);
+ 		return ERR_PTR(-ENODEV);
+diff --git a/drivers/watchdog/watchdog_core.c b/drivers/watchdog/watchdog_core.c
+index 5c600a3706..e5f6bedbce 100644
+--- a/drivers/watchdog/watchdog_core.c
++++ b/drivers/watchdog/watchdog_core.c
+@@ -405,7 +405,10 @@ static void __exit watchdog_exit(void)
+ 	ida_destroy(&watchdog_ida);
+ }
+ 
+-subsys_initcall_sync(watchdog_init);
++/* Quest kexec RAM diagnostic: registering inherited watchdog devices can
++ * block in hardware-specific setup. No watchdog userspace is required.
++ */
++/* subsys_initcall_sync(watchdog_init); */
+ module_exit(watchdog_exit);
+ 
+ MODULE_AUTHOR("Alan Cox <alan@lxorguk.ukuu.org.uk>");
+diff --git a/init/main.c b/init/main.c
+index c1b2e6c6cd..db071cfa5d 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -91,6 +91,7 @@
+ #include <linux/cache.h>
+ #include <linux/rodata_test.h>
+ #include <linux/jump_label.h>
++#include <linux/reboot.h>
+ 
+ #include <asm/io.h>
+ #include <asm/setup.h>
+@@ -552,6 +553,70 @@ static void __init mm_init(void)
+ 	pti_init();
+ }
+ 
++#define QKX_LOG_PHYS 0x9ba80000ULL
++#define QKX_LOG_SIZE 0x10000
++#define QKX_LOG_MAGIC 0x514b584c
++
++struct qkx_log_header {
++	u32 magic;
++	u32 write_pos;
++	u32 wraps;
++	u32 reserved;
++};
++
++static void __iomem *qkx_log;
++
++static void qkx_log_write(struct console *con, const char *s, unsigned int count)
++{
++	struct qkx_log_header __iomem *h = qkx_log;
++	u32 pos, wraps;
++	unsigned int i;
++	const u32 capacity = QKX_LOG_SIZE - sizeof(*h);
++
++	if (!h || readl_relaxed(&h->magic) != QKX_LOG_MAGIC)
++		return;
++	pos = readl_relaxed(&h->write_pos);
++	wraps = readl_relaxed(&h->wraps);
++	for (i = 0; i < count; i++) {
++		writeb_relaxed(s[i], qkx_log + sizeof(*h) + pos);
++		if (++pos == capacity) {
++			pos = 0;
++			wraps++;
++		}
++	}
++	writel_relaxed(pos, &h->write_pos);
++	writel_relaxed(wraps, &h->wraps);
++	wmb();
++}
++
++static struct console qkx_log_console = {
++	.name = "qkxram",
++	.write = qkx_log_write,
++	.flags = CON_ENABLED | CON_PRINTBUFFER,
++	.index = -1,
++};
++
++static void __init qkx_log_console_init(void)
++{
++	struct qkx_log_header __iomem *h;
++	struct page *pages[QKX_LOG_SIZE / PAGE_SIZE];
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(pages); i++)
++		pages[i] = pfn_to_page((QKX_LOG_PHYS >> PAGE_SHIFT) + i);
++	qkx_log = vmap(pages, ARRAY_SIZE(pages), VM_MAP | VM_IOREMAP,
++			pgprot_writecombine(PAGE_KERNEL));
++	if (!qkx_log)
++		return;
++	h = qkx_log;
++	memset_io(qkx_log, 0, QKX_LOG_SIZE);
++	writel_relaxed(0, &h->write_pos);
++	writel_relaxed(0, &h->wraps);
++	writel_relaxed(QKX_LOG_MAGIC, &h->magic);
++	wmb();
++	register_console(&qkx_log_console);
++}
++
+ asmlinkage __visible void __init start_kernel(void)
+ {
+ 	char *command_line;
+@@ -686,6 +751,7 @@ asmlinkage __visible void __init start_kernel(void)
+ 	 * this. But we do want output early, in case something goes wrong.
+ 	 */
+ 	console_init();
++	qkx_log_console_init();
+ 	if (panic_later)
+ 		panic("Too many boot %s vars at `%s'", panic_later,
+ 		      panic_param);
+@@ -959,9 +1025,227 @@ static char *initcall_level_names[] __initdata = {
+ 	"late",
+ };
+ 
++static void __iomem *qkx_wdt;
++
++static void __init qkx_force_watchdog_off(void)
++{
++	if (!qkx_wdt)
++		qkx_wdt = ioremap(0x17c10000, 0x1000);
++	if (qkx_wdt) {
++		writel_relaxed(0, qkx_wdt + 0x08);
++		mb();
++	}
++}
++
++static atomic_t qkx_initcall_progress = ATOMIC_INIT(0);
++static atomic_t qkx_cur_level = ATOMIC_INIT(-1);
++static atomic_t qkx_cur_index = ATOMIC_INIT(-1);
++static atomic_t qkx_boot_done = ATOMIC_INIT(0);
++static char qkx_cur_name[128];
++
++extern void qkx_force_warm_reboot(void);
++extern void qkx_minimal_warm_reset(void) __noreturn;
++
++static int qkx_panic_warm_reset(struct notifier_block *nb,
++				unsigned long event, void *ptr)
++{
++	/* Avoid the Qualcomm kernel_panic restart reason: Android's
++	 * panicreporter loads rdbg and can itself panic before retained RAM is
++	 * collected. qpnp_pon and msm-poweroff are ready by the initcall stages
++	 * where diagnostic target panics have occurred. */
++	qkx_minimal_warm_reset();
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block qkx_panic_nb = {
++	.notifier_call = qkx_panic_warm_reset,
++	.priority = INT_MAX,
++};
++
++static void qkx_note_phase(int level, int index, const char *fmt, ...)
++{
++	va_list ap;
++
++	qkx_cur_name[0] = '\0';
++	va_start(ap, fmt);
++	vscnprintf(qkx_cur_name, sizeof(qkx_cur_name), fmt, ap);
++	va_end(ap);
++	/* publish name before the coordinates that reference it */
++	smp_wmb();
++	atomic_set(&qkx_cur_level, level);
++	atomic_set(&qkx_cur_index, index);
++	atomic_inc(&qkx_initcall_progress);
++}
++
++static void __init __maybe_unused qkx_diag_warm_reset(void)
++{
++	pr_emerg("QKX: deliberate retained-log warm reset\n");
++	qkx_force_warm_reboot();
++	machine_restart("qkx-log");
++	panic("QKX: machine_restart returned");
++}
++
++/*
++ * Boot watchdog running on a secondary CPU.  If boot progress
++ * stalls for several seconds (boot CPU hung with interrupts off),
++ * record the stall location directly in the retained RAM log and
++ * force a DRAM-preserving warm reset so the log can be recovered
++ * after Android returns.
++ */
++static int qkx_boot_watchdog(void *unused)
++{
++	u64 start_ns = ktime_get_mono_fast_ns();
++	u64 last_progress_ns = start_ns;
++	u64 last_hb_ns = start_ns;
++	int progress = atomic_read(&qkx_initcall_progress);
++
++	/* Pure busy loop: never sleep, never rely on timer IRQs or on
++	 * wakeups from deep idle (whose RPMh/AOP-assisted wake path may
++	 * be dead after the kexec handoff).  ktime_get_mono_fast_ns()
++	 * reads the arch counter directly, so this works with all
++	 * interrupts disabled and the scheduler frozen. */
++	while (!atomic_read(&qkx_boot_done)) {
++		int cur = atomic_read(&qkx_initcall_progress);
++		u64 now = ktime_get_mono_fast_ns();
++		u64 stall_ms, total_ms, limit_ms;
++		char msg[192];
++		int len;
++
++		if (cur != progress) {
++			progress = cur;
++			last_progress_ns = now;
++		}
++
++		stall_ms = (now - last_progress_ns) / 1000000;
++		total_ms = (now - start_ns) / 1000000;
++
++		/* Heartbeat into the retained log every 5s. */
++		if (now - last_hb_ns >= 5000000000ULL) {
++			last_hb_ns = now;
++			smp_rmb();
++			len = scnprintf(msg, sizeof(msg),
++				"QKX: hb t=%llums level=%d idx=%d fn %s\n",
++					(unsigned long long)total_ms,
++					atomic_read(&qkx_cur_level),
++					atomic_read(&qkx_cur_index),
++					qkx_cur_name);
++			qkx_log_write(NULL, msg, len);
++		}
++
++		/* Allow the built-in ~21s RCU stall detector to identify any CPU
++		 * blocking an expedited grace period before recovery resets us. */
++		limit_ms = (atomic_read(&qkx_cur_level) == 99) ?
++			   60000 : 30000;
++
++		/* Total boot time cap: kernel must reach userspace
++		 * (level 99) within 240s even with slow probes. */
++		if (atomic_read(&qkx_cur_level) != 99 && total_ms > 240000) {
++			smp_rmb();
++			len = scnprintf(msg, sizeof(msg),
++				"QKX: boot watchdog: 240s boot cap hit at level %d idx %d fn %s; forcing DRAM-preserving warm reset\n",
++					atomic_read(&qkx_cur_level),
++					atomic_read(&qkx_cur_index),
++					qkx_cur_name);
++			qkx_log_write(NULL, msg, len);
++			qkx_minimal_warm_reset();
++		}
++
++		if (stall_ms >= limit_ms) {
++			smp_rmb();
++			len = scnprintf(msg, sizeof(msg),
++				"QKX: boot watchdog: no progress for %ums; stalled at level %d index %d fn %s; forcing DRAM-preserving warm reset\n",
++					(unsigned int)stall_ms,
++					atomic_read(&qkx_cur_level),
++					atomic_read(&qkx_cur_index), qkx_cur_name);
++			qkx_log_write(NULL, msg, len);
++			/* Capture PID 1's live stack before resetting.  This is more
++			 * useful than another layer of initcall markers when a shared
++			 * synchronization primitive stalls at varying call sites. */
++			{
++				struct task_struct *init_task = NULL;
++
++				rcu_read_lock();
++				init_task = find_task_by_vpid(1);
++				if (init_task)
++					get_task_struct(init_task);
++				rcu_read_unlock();
++				if (init_task) {
++					pr_emerg("QKX: watchdog PID 1 stack follows\n");
++					sched_show_task(init_task);
++					put_task_struct(init_task);
++					mdelay(500);
++				}
++			}
++			qkx_minimal_warm_reset();
++		}
++
++		mdelay(20);
++		/* The watchdog intentionally never sleeps, but a permanent busy
++		 * loop otherwise prevents this CPU from reporting an RCU
++		 * quiescent state and deadlocks synchronize_rcu() during boot. */
++		rcu_note_voluntary_context_switch(current);
++	}
++	return 0;
++}
++
++static void __init qkx_start_boot_watchdog(void)
++{
++	struct task_struct *t;
++	int cpu = 1;
++
++	atomic_notifier_chain_register(&panic_notifier_list, &qkx_panic_nb);
++
++	while (cpu < num_possible_cpus() && !cpu_online(cpu))
++		cpu++;
++	if (cpu >= num_possible_cpus()) {
++		pr_warn("QKX: no secondary CPU for boot watchdog\n");
++		return;
++	}
++	t = kthread_create(qkx_boot_watchdog, NULL, "qkx-bwdog");
++	if (IS_ERR(t)) {
++		pr_warn("QKX: failed to create boot watchdog\n");
++		return;
++	}
++	kthread_bind(t, cpu);
++	wake_up_process(t);
++	pr_info("QKX: boot watchdog pinned to cpu%d\n", cpu);
++}
++
++/*
++ * Userspace keepalive channel: initramfs /init writes 'd' to disarm the
++ * boot watchdog once it reaches its steady state, or anything else to
++ * refresh progress while it is deliberately slow.
++ */
++void qkx_deferred_probe_kick(void);
++
++static ssize_t qkx_bootdone_write(struct file *f, const char __user *buf,
++				  size_t n, loff_t *pos)
++{
++	char c;
++
++	if (n < 1 || copy_from_user(&c, buf, 1))
++		return -EINVAL;
++	if (c == 'd')
++		atomic_set(&qkx_boot_done, 1);
++	else if (c == 'p')
++		qkx_deferred_probe_kick();
++	else if (c == 'r') {
++		pr_emerg("QKX: userspace requested DRAM-preserving warm reset\n");
++		qkx_minimal_warm_reset();
++	} else
++		atomic_inc(&qkx_initcall_progress);
++	return n;
++}
++
++static const struct file_operations qkx_bootdone_fops = {
++	.owner = THIS_MODULE,
++	.write = qkx_bootdone_write,
++};
++
+ static void __init do_initcall_level(int level)
+ {
+ 	initcall_entry_t *fn;
++	unsigned int qkx_index = 0;
+ 
+ 	strcpy(initcall_command_line, saved_command_line);
+ 	parse_args(initcall_level_names[level],
+@@ -971,8 +1255,14 @@ static void __init do_initcall_level(int level)
+ 		   NULL, &repair_env_string);
+ 
+ 	trace_initcall_level(initcall_level_names[level]);
+-	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
++	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++) {
++		qkx_force_watchdog_off();
++		qkx_note_phase(level, qkx_index, "%pf", initcall_from_entry(fn));
+ 		do_one_initcall(initcall_from_entry(fn));
++		atomic_inc(&qkx_initcall_progress);
++		qkx_force_watchdog_off();
++		qkx_index++;
++	}
+ }
+ 
+ static void __init do_initcalls(void)
+@@ -992,12 +1282,18 @@ static void __init do_initcalls(void)
+  */
+ static void __init do_basic_setup(void)
+ {
++	qkx_note_phase(-1, 0, "cpuset_init_smp");
+ 	cpuset_init_smp();
++	qkx_note_phase(-1, 1, "shmem_init");
+ 	shmem_init();
++	qkx_note_phase(-1, 2, "driver_init");
+ 	driver_init();
++	qkx_note_phase(-1, 3, "init_irq_proc");
+ 	init_irq_proc();
++	qkx_note_phase(-1, 4, "do_ctors");
+ 	do_ctors();
+ 	usermodehelper_enable();
++	qkx_note_phase(-1, 5, "do_initcalls");
+ 	do_initcalls();
+ }
+ 
+@@ -1141,6 +1437,8 @@ static noinline void __init kernel_init_freeable(void)
+ 	 */
+ 	wait_for_completion(&kthreadd_done);
+ 
++	qkx_note_phase(-1, 100, "kthreadd_done");
++
+ 	/* Now the scheduler is fully set up and can do blocking allocations */
+ 	gfp_allowed_mask = __GFP_BITS_MASK;
+ 
+@@ -1153,23 +1451,31 @@ static noinline void __init kernel_init_freeable(void)
+ 
+ 	smp_prepare_cpus(setup_max_cpus);
+ 
++	qkx_note_phase(-1, 101, "workqueue_init");
+ 	workqueue_init();
+-
++	qkx_note_phase(-1, 102, "init_mm_internals");
+ 	init_mm_internals();
+-
++	qkx_note_phase(-1, 103, "do_pre_smp_initcalls");
+ 	do_pre_smp_initcalls();
++	qkx_note_phase(-1, 104, "lockup_detector_init");
+ 	lockup_detector_init();
+-
++	qkx_note_phase(-1, 105, "smp_init");
+ 	smp_init();
++	qkx_note_phase(-1, 106, "sched_init_smp");
+ 	sched_init_smp();
++	qkx_start_boot_watchdog();
+ 
++	qkx_note_phase(-1, 107, "page_alloc_init_late");
+ 	page_alloc_init_late();
+ 	/* Initialize page ext after all struct pages are initialized. */
++	qkx_note_phase(-1, 108, "page_ext_init");
+ 	page_ext_init();
+ 
++	qkx_note_phase(-1, 109, "do_basic_setup");
+ 	do_basic_setup();
+ 
+ 	/* Open the /dev/console on the rootfs, this should never fail */
++	qkx_note_phase(-1, 110, "open_console");
+ 	if (ksys_open((const char __user *) "/dev/console", O_RDWR, 0) < 0)
+ 		pr_err("Warning: unable to open an initial console.\n");
+ 
+@@ -1186,6 +1492,7 @@ static noinline void __init kernel_init_freeable(void)
+ 	if (ksys_access((const char __user *)
+ 			ramdisk_execute_command, 0) != 0) {
+ 		ramdisk_execute_command = NULL;
++		qkx_note_phase(-1, 111, "prepare_namespace");
+ 		prepare_namespace();
+ 	}
+ 
+@@ -1198,6 +1505,12 @@ static noinline void __init kernel_init_freeable(void)
+ 	 * and default modules
+ 	 */
+ 
++	qkx_note_phase(-1, 112, "integrity_load_keys");
+ 	integrity_load_keys();
++	qkx_note_phase(-1, 113, "load_default_modules");
+ 	load_default_modules();
++
++	if (!proc_create("qkx_bootdone", 0220, NULL, &qkx_bootdone_fops))
++		pr_warn("QKX: failed to create /proc/qkx_bootdone\n");
++	qkx_note_phase(99, 0, "userspace-init");
+ }
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 23a44101cc..37f6731029 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -1638,6 +1638,7 @@ void ip_send_unicast_reply(struct sock *sk, struct sk_buff *skb,
+ void __init ip_init(void)
+ {
+ 	ip_rt_init();
++
+ 	inet_initpeers();
+ 
+ #if defined(CONFIG_IP_MULTICAST)
+diff --git a/techpack/camera/drivers/cam_cdm/cam_cdm_hw_core.c b/techpack/camera/drivers/cam_cdm/cam_cdm_hw_core.c
+index dc493855a5..652c12c6a1 100644
+--- a/techpack/camera/drivers/cam_cdm/cam_cdm_hw_core.c
++++ b/techpack/camera/drivers/cam_cdm/cam_cdm_hw_core.c
+@@ -28,6 +28,17 @@
+ 
+ #define CAM_CDM_BL_FIFO_WAIT_TIMEOUT 2000
+ 
++static int qkx_cpas_probe_stop = -1;
++core_param(qkx_cpas_probe_stop, qkx_cpas_probe_stop, int, 0444);
++
++#define QKX_CPAS_STOP(_stage, _pdev) do { \
++	if (qkx_cpas_probe_stop == (_stage)) { \
++		pr_emerg("qkxcpas: %s diagnostic stop stage %d\n", \
++			 dev_name(&(_pdev)->dev), (_stage)); \
++		return -ECANCELED; \
++	} \
++} while (0)
++
+ static void cam_hw_cdm_work(struct work_struct *work);
+ 
+ /* DT match table entry for all CDM variants*/
+@@ -913,7 +924,17 @@ int cam_hw_cdm_deinit(void *hw_priv,
+ 	soc_info = &cdm_hw->soc_info;
+ 	cdm_core = cdm_hw->core_info;
+ 	atomic_set(&cdm_core->work_record, 0);
++	if (qkx_cpas_probe_stop == 80) {
++		pr_emerg("qkxcpas: deinit diagnostic stop before disable_platform_resource\n");
++		return -ECANCELED;
++	}
++	pr_emerg("qkxcpas: deinit before disable_platform_resource\n");
+ 	rc = cam_soc_util_disable_platform_resource(soc_info, true, true);
++	pr_emerg("qkxcpas: deinit disable_platform_resource ret=%d\n", rc);
++	if (qkx_cpas_probe_stop == 81) {
++		pr_emerg("qkxcpas: deinit diagnostic stop after disable_platform_resource\n");
++		return -ECANCELED;
++	}
+ 	if (rc) {
+ 		CAM_ERR(CAM_CDM, "disable platform failed");
+ 	} else {
+@@ -927,6 +948,8 @@ int cam_hw_cdm_deinit(void *hw_priv,
+ int cam_hw_cdm_probe(struct platform_device *pdev)
+ {
+ 	int rc;
++
++	QKX_CPAS_STOP(0, pdev);
+ 	struct cam_hw_info *cdm_hw = NULL;
+ 	struct cam_hw_intf *cdm_hw_intf = NULL;
+ 	struct cam_cdm *cdm_core = NULL;
+@@ -967,6 +990,7 @@ int cam_hw_cdm_probe(struct platform_device *pdev)
+ 		CAM_ERR(CAM_CDM, "Failed to get dt properties");
+ 		goto release_mem;
+ 	}
++	QKX_CPAS_STOP(1, pdev);
+ 	cdm_hw_intf->hw_idx = cdm_hw->soc_info.index;
+ 	cdm_core = (struct cam_cdm *)cdm_hw->core_info;
+ 	soc_private = (struct cam_cdm_private_dt_data *)
+@@ -1003,11 +1027,15 @@ int cam_hw_cdm_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, cdm_hw_intf);
+ 
++	pr_emerg("qkxcpas: %s before cam_smmu_get_handle\n", dev_name(&pdev->dev));
+ 	rc = cam_smmu_get_handle("cpas-cdm0", &cdm_core->iommu_hdl.non_secure);
++	pr_emerg("qkxcpas: %s cam_smmu_get_handle ret=%d handle=%d\n",
++		 dev_name(&pdev->dev), rc, cdm_core->iommu_hdl.non_secure);
+ 	if (rc < 0) {
+ 		CAM_ERR(CAM_CDM, "cpas-cdm get iommu handle failed");
+ 		goto unlock_release_mem;
+ 	}
++	QKX_CPAS_STOP(2, pdev);
+ 	cam_smmu_set_client_page_fault_handler(cdm_core->iommu_hdl.non_secure,
+ 		cam_hw_cdm_iommu_fault_handler, cdm_hw);
+ 
+@@ -1017,19 +1045,28 @@ int cam_hw_cdm_probe(struct platform_device *pdev)
+ 		WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_SYSFS,
+ 		CAM_CDM_INFLIGHT_WORKS);
+ 
++	pr_emerg("qkxcpas: %s before request_platform_resource\n",
++		 dev_name(&pdev->dev));
+ 	rc = cam_soc_util_request_platform_resource(&cdm_hw->soc_info,
+ 			cam_hw_cdm_irq, cdm_hw);
++	pr_emerg("qkxcpas: %s request_platform_resource ret=%d\n",
++		 dev_name(&pdev->dev), rc);
+ 	if (rc) {
+ 		CAM_ERR(CAM_CDM, "Failed to request platform resource");
+ 		goto destroy_non_secure_hdl;
+ 	}
++	QKX_CPAS_STOP(3, pdev);
+ 
+ 	cpas_parms.cam_cpas_client_cb = cam_cdm_cpas_cb;
+ 	cpas_parms.cell_index = cdm_hw->soc_info.index;
+ 	cpas_parms.dev = &pdev->dev;
+ 	cpas_parms.userdata = cdm_hw_intf;
+ 	strlcpy(cpas_parms.identifier, "cpas-cdm", CAM_HW_IDENTIFIER_LENGTH);
++	pr_emerg("qkxcpas: %s before cam_cpas_register_client\n",
++		 dev_name(&pdev->dev));
+ 	rc = cam_cpas_register_client(&cpas_parms);
++	pr_emerg("qkxcpas: %s cam_cpas_register_client ret=%d\n",
++		 dev_name(&pdev->dev), rc);
+ 	if (rc) {
+ 		CAM_ERR(CAM_CDM, "Virtual CDM CPAS registration failed");
+ 		goto release_platform_resource;
+@@ -1037,6 +1074,7 @@ int cam_hw_cdm_probe(struct platform_device *pdev)
+ 	CAM_DBG(CAM_CDM, "CPAS registration successful handle=%d",
+ 		cpas_parms.client_handle);
+ 	cdm_core->cpas_handle = cpas_parms.client_handle;
++	QKX_CPAS_STOP(4, pdev);
+ 
+ 	axi_vote = kzalloc(sizeof(struct cam_axi_vote), GFP_KERNEL);
+ 	if (!axi_vote) {
+@@ -1053,19 +1091,27 @@ int cam_hw_cdm_probe(struct platform_device *pdev)
+ 	axi_vote->axi_path[0].mnoc_ab_bw = CAM_CPAS_DEFAULT_AXI_BW;
+ 	axi_vote->axi_path[0].mnoc_ib_bw = CAM_CPAS_DEFAULT_AXI_BW;
+ 
++	pr_emerg("qkxcpas: %s before cam_cpas_start\n", dev_name(&pdev->dev));
+ 	rc = cam_cpas_start(cdm_core->cpas_handle, &ahb_vote, axi_vote);
++	pr_emerg("qkxcpas: %s cam_cpas_start ret=%d\n",
++		 dev_name(&pdev->dev), rc);
+ 	kfree(axi_vote);
+ 	if (rc) {
+ 		CAM_ERR(CAM_CDM, "CPAS start failed");
+ 		goto cpas_unregister;
+ 	}
++	QKX_CPAS_STOP(5, pdev);
+ 
++	pr_emerg("qkxcpas: %s before cam_hw_cdm_init\n", dev_name(&pdev->dev));
+ 	rc = cam_hw_cdm_init(cdm_hw, NULL, 0);
++	pr_emerg("qkxcpas: %s cam_hw_cdm_init ret=%d\n",
++		 dev_name(&pdev->dev), rc);
+ 	if (rc) {
+ 		CAM_ERR(CAM_CDM, "Failed to Init CDM HW");
+ 		goto cpas_stop;
+ 	}
+ 	cdm_hw->open_count++;
++	QKX_CPAS_STOP(6, pdev);
+ 
+ 	if (cam_cdm_read_hw_reg(cdm_hw, CDM_CFG_HW_VERSION,
+ 		&cdm_core->hw_version)) {
+@@ -1079,6 +1125,7 @@ int cam_hw_cdm_probe(struct platform_device *pdev)
+ 		goto deinit;
+ 	}
+ 
++	QKX_CPAS_STOP(7, pdev);
+ 	CAM_DBG(CAM_CDM, "CDM Hw version read success family =%x hw =%x",
+ 		cdm_core->hw_family_version, cdm_core->hw_version);
+ 	cdm_core->ops = cam_cdm_get_ops(cdm_core->hw_version, NULL,
+@@ -1100,6 +1147,7 @@ int cam_hw_cdm_probe(struct platform_device *pdev)
+ 		cdm_hw->open_count--;
+ 		goto cpas_stop;
+ 	}
++	QKX_CPAS_STOP(8, pdev);
+ 
+ 	rc = cam_cpas_stop(cdm_core->cpas_handle);
+ 	if (rc) {
+@@ -1107,6 +1155,7 @@ int cam_hw_cdm_probe(struct platform_device *pdev)
+ 		cdm_hw->open_count--;
+ 		goto cpas_unregister;
+ 	}
++	QKX_CPAS_STOP(9, pdev);
+ 
+ 	rc = cam_cdm_intf_register_hw_cdm(cdm_hw_intf,
+ 		soc_private, CAM_HW_CDM, &cdm_core->index);
+@@ -1115,6 +1164,7 @@ int cam_hw_cdm_probe(struct platform_device *pdev)
+ 		cdm_hw->open_count--;
+ 		goto cpas_unregister;
+ 	}
++	QKX_CPAS_STOP(10, pdev);
+ 	cdm_hw->open_count--;
+ 	mutex_unlock(&cdm_hw->hw_mutex);
+ 
+diff --git a/techpack/camera/drivers/cam_cpas/cam_cpas_soc.c b/techpack/camera/drivers/cam_cpas/cam_cpas_soc.c
+index 3b4e4fb252..9d0a0df01a 100644
+--- a/techpack/camera/drivers/cam_cpas/cam_cpas_soc.c
++++ b/techpack/camera/drivers/cam_cpas/cam_cpas_soc.c
+@@ -143,7 +143,10 @@ static int cam_cpas_update_camnoc_node(struct cam_cpas *cpas_core,
+ 	struct device_node *camnoc_node;
+ 	int rc;
+ 
+-	camnoc_node = of_find_node_by_name(curr_node,
++	/* of_find_node_by_name() searches the rest of the whole tree, which
++	 * picks up other nodes' ports when DT node order differs.
++	 */
++	camnoc_node = of_get_child_by_name(curr_node,
+ 			"qcom,axi-port-camnoc");
+ 	if (camnoc_node) {
+ 
+@@ -192,7 +195,7 @@ static int cam_cpas_parse_node_tree(struct cam_cpas *cpas_core,
+ 	uint32_t client_idx = 0, cell_idx = 0, level_idx = 0;
+ 	int rc = 0, count = 0, i;
+ 
+-	camera_bus_node = of_find_node_by_name(of_node, "camera-bus-nodes");
++	camera_bus_node = of_get_child_by_name(of_node, "camera-bus-nodes");
+ 	if (!camera_bus_node) {
+ 		CAM_ERR(CAM_CPAS, "Camera Bus node not found in cpas DT node");
+ 		return -EINVAL;
+@@ -262,7 +265,7 @@ static int cam_cpas_parse_node_tree(struct cam_cpas *cpas_core,
+ 				&curr_node_ptr->merge_type);
+ 
+ 			curr_node_ptr->axi_port_idx = -1;
+-			mnoc_node = of_find_node_by_name(curr_node,
++			mnoc_node = of_get_child_by_name(curr_node,
+ 				"qcom,axi-port-mnoc");
+ 			if (mnoc_node) {
+ 				if (mnoc_idx >= CAM_CPAS_MAX_AXI_PORTS)
+diff --git a/techpack/camera/drivers/cam_sensor_module/cam_cci/cam_cci_soc.c b/techpack/camera/drivers/cam_sensor_module/cam_cci/cam_cci_soc.c
+index 10f274c907..9d7c784d0b 100644
+--- a/techpack/camera/drivers/cam_sensor_module/cam_cci/cam_cci_soc.c
++++ b/techpack/camera/drivers/cam_sensor_module/cam_cci/cam_cci_soc.c
+@@ -263,16 +263,16 @@ static void cam_cci_init_clk_params(struct cci_device *cci_dev)
+ 	for (count = 0; count < I2C_MAX_MODES; count++) {
+ 
+ 		if (count == I2C_STANDARD_MODE)
+-			src_node = of_find_node_by_name(of_node,
++			src_node = of_get_child_by_name(of_node,
+ 				"qcom,i2c_standard_mode");
+ 		else if (count == I2C_FAST_MODE)
+-			src_node = of_find_node_by_name(of_node,
++			src_node = of_get_child_by_name(of_node,
+ 				"qcom,i2c_fast_mode");
+ 		else if (count == I2C_FAST_PLUS_MODE)
+-			src_node = of_find_node_by_name(of_node,
++			src_node = of_get_child_by_name(of_node,
+ 				"qcom,i2c_fast_plus_mode");
+ 		else
+-			src_node = of_find_node_by_name(of_node,
++			src_node = of_get_child_by_name(of_node,
+ 				"qcom,i2c_custom_mode");
+ 
+ 		rc = of_property_read_u32(src_node, "hw-thigh", &val);
+diff --git a/techpack/camera/drivers/cam_smmu/cam_smmu_api.c b/techpack/camera/drivers/cam_smmu/cam_smmu_api.c
+index b249182af9..fc47ef53ba 100644
+--- a/techpack/camera/drivers/cam_smmu/cam_smmu_api.c
++++ b/techpack/camera/drivers/cam_smmu/cam_smmu_api.c
+@@ -824,6 +824,9 @@ static int cam_smmu_create_add_handle_in_table(char *name,
+ 
+ 	/* create handle and add in the iommu hardware table */
+ 	for (i = 0; i < iommu_cb_set.cb_num; i++) {
++		/* Context-bank probes can be incomplete while dependencies defer. */
++		if (!iommu_cb_set.cb_info[i].name)
++			continue;
+ 		if (!strcmp(iommu_cb_set.cb_info[i].name, name)) {
+ 			mutex_lock(&iommu_cb_set.cb_info[i].lock);
+ 			if (iommu_cb_set.cb_info[i].handle != HANDLE_INIT) {
+diff --git a/techpack/display/msm/dsi/dsi_ctrl.c b/techpack/display/msm/dsi/dsi_ctrl.c
+index acaa32e129..18177a81fe 100644
+--- a/techpack/display/msm/dsi/dsi_ctrl.c
++++ b/techpack/display/msm/dsi/dsi_ctrl.c
+@@ -572,34 +572,34 @@ static int dsi_ctrl_clocks_deinit(struct dsi_ctrl *ctrl)
+ 	struct dsi_link_hs_clk_info *hs_link = &ctrl->clk_info.hs_link_clks;
+ 	struct dsi_clk_link_set *rcg = &ctrl->clk_info.rcg_clks;
+ 
+-	if (core->mdp_core_clk)
++	if (!IS_ERR_OR_NULL(core->mdp_core_clk))
+ 		devm_clk_put(&ctrl->pdev->dev, core->mdp_core_clk);
+-	if (core->iface_clk)
++	if (!IS_ERR_OR_NULL(core->iface_clk))
+ 		devm_clk_put(&ctrl->pdev->dev, core->iface_clk);
+-	if (core->core_mmss_clk)
++	if (!IS_ERR_OR_NULL(core->core_mmss_clk))
+ 		devm_clk_put(&ctrl->pdev->dev, core->core_mmss_clk);
+-	if (core->bus_clk)
++	if (!IS_ERR_OR_NULL(core->bus_clk))
+ 		devm_clk_put(&ctrl->pdev->dev, core->bus_clk);
+-	if (core->mnoc_clk)
++	if (!IS_ERR_OR_NULL(core->mnoc_clk))
+ 		devm_clk_put(&ctrl->pdev->dev, core->mnoc_clk);
+ 
+ 	memset(core, 0x0, sizeof(*core));
+ 
+-	if (hs_link->byte_clk)
++	if (!IS_ERR_OR_NULL(hs_link->byte_clk))
+ 		devm_clk_put(&ctrl->pdev->dev, hs_link->byte_clk);
+-	if (hs_link->pixel_clk)
++	if (!IS_ERR_OR_NULL(hs_link->pixel_clk))
+ 		devm_clk_put(&ctrl->pdev->dev, hs_link->pixel_clk);
+-	if (lp_link->esc_clk)
++	if (!IS_ERR_OR_NULL(lp_link->esc_clk))
+ 		devm_clk_put(&ctrl->pdev->dev, lp_link->esc_clk);
+-	if (hs_link->byte_intf_clk)
++	if (!IS_ERR_OR_NULL(hs_link->byte_intf_clk))
+ 		devm_clk_put(&ctrl->pdev->dev, hs_link->byte_intf_clk);
+ 
+ 	memset(hs_link, 0x0, sizeof(*hs_link));
+ 	memset(lp_link, 0x0, sizeof(*lp_link));
+ 
+-	if (rcg->byte_clk)
++	if (!IS_ERR_OR_NULL(rcg->byte_clk))
+ 		devm_clk_put(&ctrl->pdev->dev, rcg->byte_clk);
+-	if (rcg->pixel_clk)
++	if (!IS_ERR_OR_NULL(rcg->pixel_clk))
+ 		devm_clk_put(&ctrl->pdev->dev, rcg->pixel_clk);
+ 
+ 	memset(rcg, 0x0, sizeof(*rcg));
+@@ -1935,6 +1935,8 @@ static int dsi_ctrl_dev_probe(struct platform_device *pdev)
+ 	if (!dsi_ctrl)
+ 		return -ENOMEM;
+ 
++	/* Cleanup paths use ctrl->pdev before successful probe completion. */
++	dsi_ctrl->pdev = pdev;
+ 	dsi_ctrl->version = version;
+ 	dsi_ctrl->irq_info.irq_num = -1;
+ 	dsi_ctrl->irq_info.irq_stat_mask = 0x0;
+diff --git a/techpack/display/msm/sde_power_handle.c b/techpack/display/msm/sde_power_handle.c
+index 65d580765b..142be69859 100644
+--- a/techpack/display/msm/sde_power_handle.c
++++ b/techpack/display/msm/sde_power_handle.c
+@@ -293,8 +293,10 @@ static int _sde_power_data_bus_set_quota(
+ 	int rc;
+ 
+ 	if (pdbus->data_bus_hdl < 1) {
+-		pr_err("invalid bus handle %d\n", pdbus->data_bus_hdl);
+-		return -EINVAL;
++		/* qkx: data_bus_hdl==0 is now a normal, tolerated "no bus
++		 * scaling available" state (see sde_power_data_bus_parse);
++		 * skip the vote instead of failing the caller. */
++		return 0;
+ 	}
+ 
+ 	if (!in_ab_quota && !in_ib_quota)  {
+@@ -405,8 +407,10 @@ static int sde_power_data_bus_parse(struct platform_device *pdev,
+ 	pdbus->data_bus_hdl = msm_bus_scale_register_client(
+ 			pdbus->data_bus_scale_table);
+ 	if (!pdbus->data_bus_hdl) {
+-		pr_err("data_bus_client register failed\n");
+-		rc = -EINVAL;
++		/* qkx: same msm_bus unavailability as sde_power_reg_bus_parse;
++		 * continue without data-bus scaling rather than failing probe. */
++		pr_warn("qkx: data_bus_client register failed; continuing without bus scaling\n");
++		rc = 0;
+ 		goto end;
+ 	}
+ 	pr_debug("register %s data_bus_hdl=%x\n", name, pdbus->data_bus_hdl);
+@@ -435,8 +439,17 @@ static int sde_power_reg_bus_parse(struct platform_device *pdev,
+ 		phandle->reg_bus_hdl = msm_bus_scale_register_client(
+ 			      bus_scale_table);
+ 		if (!phandle->reg_bus_hdl) {
+-			pr_err("reg_bus_client register failed\n");
+-			rc = -EINVAL;
++			/*
++			 * qkx: after kexec msm_bus may never come up (deferred
++			 * retries are disabled in this diagnostic kernel), which
++			 * would leave the whole KMS/DRM device probe permanently
++			 * dead. reg_bus_hdl==0 is already the "no bus scaling"
++			 * state every other caller in this file guards against
++			 * (sde_power_reg_bus_unregister/_update), so continue
++			 * without it instead of failing the probe.
++			 */
++			pr_warn("qkx: reg_bus_client register failed; continuing without bus scaling\n");
++			rc = 0;
+ 			goto end;
+ 		}
+ 		pr_debug("register reg_bus_hdl=%x\n", phandle->reg_bus_hdl);
+@@ -528,6 +541,12 @@ int sde_power_resource_init(struct platform_device *pdev,
+ 	}
+ 	mp = &phandle->mp;
+ 	phandle->dev = &pdev->dev;
++	/* Deinit is called on deferred/failed probes, so synchronization and
++	 * list state must be valid before the first operation that can fail. */
++	INIT_LIST_HEAD(&phandle->event_list);
++	mutex_init(&phandle->phandle_lock);
++	phandle->rsc_client = NULL;
++	phandle->rsc_client_init = false;
+ 
+ 	rc = sde_power_parse_dt_clock(pdev, mp);
+ 	if (rc) {
+@@ -584,13 +603,6 @@ int sde_power_resource_init(struct platform_device *pdev,
+ 	else
+ 		pr_debug("cx ipeak client parse failed\n");
+ 
+-	INIT_LIST_HEAD(&phandle->event_list);
+-
+-	phandle->rsc_client = NULL;
+-	phandle->rsc_client_init = false;
+-
+-	mutex_init(&phandle->phandle_lock);
+-
+ 	return rc;
+ 
+ data_bus_err:
+diff --git a/techpack/display/msm/sde_rsc.c b/techpack/display/msm/sde_rsc.c
+index b6397a9650..8fc13816dc 100644
+--- a/techpack/display/msm/sde_rsc.c
++++ b/techpack/display/msm/sde_rsc.c
+@@ -1551,8 +1551,9 @@ static int sde_rsc_probe(struct platform_device *pdev)
+ 
+ 	rsc->fs = devm_regulator_get(&pdev->dev, "vdd");
+ 	if (IS_ERR_OR_NULL(rsc->fs)) {
++		ret = !rsc->fs ? -ENODEV : PTR_ERR(rsc->fs);
+ 		rsc->fs = NULL;
+-		pr_err("unable to get regulator\n");
++		pr_err("unable to get regulator, ret=%d\n", ret);
+ 		goto sde_rsc_fail;
+ 	}
+ 
+-- 
+2.55.0
+

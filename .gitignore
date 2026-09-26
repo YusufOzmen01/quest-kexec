@@ -1,0 +1,28 @@
+# Builds and device captures
+/out/
+/build/
+/captured/
+/runs/
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+
+# Proprietary/device-specific inputs
+boot*.img
+Image
+*.dtb
+*.fdt
+*.config
+cmdline
+iomem
+
+# Editors/Python
+__pycache__/
+*.pyc
+*~
+.vscode/
+.idea/
