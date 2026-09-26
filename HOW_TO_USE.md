@@ -36,14 +36,14 @@ Find the new Ethernet interface with `ip link`. Then:
 
 ```sh
 nmcli device connect <interface>
-telnet 10.42.0.2
+tools/shell.sh
 ```
 
 If DHCP is unavailable:
 
 ```sh
 sudo ip addr add 10.42.0.1/24 dev <interface>
-telnet 10.42.0.2
+tools/shell.sh
 ```
 
 Run one command without telnet:
@@ -55,7 +55,7 @@ python3 tools/qkx_sh.py 'uname -a'
 ## 5. Return to Android
 
 ```sh
-python3 tools/qkx_sh.py 'echo r > /proc/qkx_bootdone'
+tools/return-android.sh
 ```
 
 ## Logs
