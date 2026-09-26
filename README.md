@@ -75,7 +75,7 @@ tools/load-usb-log.sh 60
 A failed handoff can reboot or lock the headset. The supplied scripts only copy
 files to `/data/local/tmp`; they do not flash, format or mount partitions.
 
-Never force-load a module built for a different Android kernel.
+Note: AI has been used heavily on this project
 
 ## License
 
