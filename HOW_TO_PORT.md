@@ -1,68 +1,56 @@
-# Port a custom Quest Pro kernel
+# Porting to another Meta Quest kernel
 
-This project is for Quest Pro only. Porting here means adapting another Quest
-Pro 4.19 kernel release, not another headset or SoC.
+This implementation has only been tested on Meta Quest Pro. Other Quest models
+use different SoCs, device trees, memory maps and hardware handoff states.
 
-## 1. Start from the matching Meta source
+## Same headset, newer kernel
 
-Find the Meta source commit for the headset OS version. Keep a clean copy for
-building the Android loader module.
+1. Get the source matching the new Android release.
+2. Build `quest_kexec.ko` against its exact config, local version and
+   `Module.symvers`.
+3. Apply the patches under `kernel/patches/` to the new target source.
+4. Resolve conflicts carefully in the affected drivers.
+5. Capture a fresh runtime device tree with `tools/capture.sh`.
+6. Test first with the supplied RAM-only initramfs.
 
-## 2. Apply the target patches
+Important target areas include:
 
-The maintained kernel fork already contains the changes. For another source
-revision, apply the patches in order:
+- ARM64 entry and CPU startup
+- GIC and SMMU inherited state
+- RPMh and interconnect voting
+- display clocks and power domains
+- USB controller and PHY handoff
+- AOP/QMP mailbox adoption
+- SPMI and charger state
+- retained logging and watchdog recovery
 
-```sh
-git am /path/to/quest-pro-kexec/kernel/patches/*.patch
-```
+## Another Quest headset
 
-Resolve conflicts by behavior, not by blindly choosing one side. The important
-areas are:
+Do not reuse the Quest Pro physical addresses or device names without checking
+them. At minimum, determine:
 
-- ARM64 entry and SMP/GIC state
-- apps SMMU and msm_bus/RPMh
-- display clocks/GDSCs/SDE
-- DWC3 and USB PHY
-- AOP QMP adoption
-- SPMI stale IRQ cleanup
-- camera CPAS/CDM
-- SMB5 charger handoff
-- retained log and boot watchdog
+- target Image, initramfs and DTB staging addresses
+- safe retained-log RAM
+- target kernel text offset and maximum image size
+- CPU, GIC and SMMU setup
+- USB controller and UDC name
+- watchdog behavior
+- platform-device names used by loader shutdown callbacks
+- AOP/mailbox protocol used by that SoC
 
-## 3. Keep the required target command line
+Update `module/loader.c`, `module/transition.S`, `tools/prepare.py` and the target
+kernel patches for the new board.
 
-`tools/prep.sh` adds:
+## First test
 
-```text
-rdinit=/init nokaslr qkx_qmp_adopt=1
-initcall_blacklist=virtual_sensor_driver_init
-```
+Keep the first target small:
 
-Do not use loader-side QMP disconnect. Taking the AP/AOP link down caused a PMIC
-reset. The target must adopt the inherited link instead.
+- static BusyBox initramfs
+- no block-device mounts
+- USB Ethernet only
+- retained kernel log enabled
 
-## 4. Keep the staging layout
+Verify CPUs, USB and basic device probing before adding a larger userspace.
 
-```text
-Image       0x90080000
-initramfs   0x93000000
-DTB         0x93200000
-retained log 0x9ba80000 (64 KiB)
-```
-
-The Image memory size must be at most `0x2f80000`. Initramfs and DTB must each
-fit in 2 MiB.
-
-## 5. Test in small steps
-
-First boot with the supplied RAM-only initramfs. Check:
-
-```sh
-getconf _NPROCESSORS_ONLN
-ls /dev/dri
-ip addr show usb0
-dmesg | grep -E 'qkxqmp|QPNP SMB5|cam_hw_cdm_init'
-```
-
-Only move to a larger userspace after the basic target is repeatable.
+Do not disconnect the AOP QMP link on Quest Pro. The tested implementation
+adopts the inherited link with `qkx_qmp_adopt=1`.
