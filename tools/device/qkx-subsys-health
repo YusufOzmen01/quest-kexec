@@ -1,0 +1,39 @@
+#!/bin/sh
+# Report whether the target kernel actually re-established the shared-memory
+# link to the remote processors after kexec.
+#
+# SMEM is the table every AP<->DSP transport is built on (glink, smp2p,
+# subsystem restart, socinfo). Stock prints a full socinfo line from it; if our
+# kernel prints dummy values, SMEM lost its probe race and the DSPs -- which are
+# still running from the stock kernel -- have no working link to the new AP.
+# Android's audio/sensor/fastrpc HALs are the first things to depend on it.
+echo "=== socinfo (dummy values mean SMEM was missed) ==="
+dmesg | grep -iE 'socinfo_print|SMEM is not initialized|SMEM_HW_SW_BUILD_ID|by SBL'
+
+echo
+echo "=== is the smem device bound to a driver? ==="
+for d in /sys/devices/platform/soc/*smem* /sys/bus/platform/devices/*smem*; do
+	[ -e "$d" ] || continue
+	echo "$d -> driver: $(readlink -f "$d/driver" 2>/dev/null || echo NONE)"
+done
+
+echo
+echo "=== platform devices still waiting on deferred probe ==="
+cat /sys/kernel/debug/devices_deferred 2>/dev/null | head -40 ||
+	echo "(devices_deferred needs debugfs mounted)"
+
+echo
+echo "=== rpmsg / glink endpoints (empty means no DSP link) ==="
+ls /sys/bus/rpmsg/devices 2>/dev/null | head -30 || echo "(no rpmsg bus)"
+
+echo
+echo "=== subsystem restart devices ==="
+ls /dev/subsys_* 2>/dev/null || echo "(none)"
+cat /sys/bus/msm_subsys/devices/*/name 2>/dev/null | head
+
+echo
+echo "=== remote processor state ==="
+for s in /sys/bus/msm_subsys/devices/subsys*/; do
+	[ -d "$s" ] || continue
+	echo "$(cat "$s/name" 2>/dev/null): restart_level=$(cat "$s/restart_level" 2>/dev/null) state=$(cat "$s/state" 2>/dev/null)"
+done

@@ -1,0 +1,72 @@
+#!/bin/busybox sh
+# Start the mounted Android in one of two ways.
+#
+#   qkx-launch-android          switch_root (default): the system image becomes
+#                               / and Android init runs as PID 1, as on a normal
+#                               boot. PID 1 does the switch (see qkx-switch);
+#                               telnet and the log watcher are restarted inside
+#                               the new root, so reconnect after a few seconds.
+#
+#   qkx-launch-android chroot   init in a chroot beside this shell. Kept for
+#                               experiments; second stage expects to be PID 1
+#                               on the real root and does not get far.
+#
+# Android's own first stage is skipped because it would insist on AVB, logical
+# partitions and Keymaster-backed encryption. Entering at selinux_setup keeps the
+# rest of the normal sequence: it loads sepolicy and then execs second_stage.
+set -e
+
+ROOT=/android
+MODE=${1:-switch}
+
+log() { echo "qkx-launch: $*"; }
+
+[ -x "$ROOT/system/bin/init" ] || { log 'nothing mounted; run qkx-mount-os first'; exit 1; }
+
+case "$MODE" in
+chroot)
+	# This kernel has no PID namespaces (CONFIG_PID_NS off, as on stock
+	# Android), so init runs as an ordinary process beside our shell.
+	log 'starting init in a chroot; output in /tmp/android-init.log'
+	setsid chroot "$ROOT" /system/bin/init selinux_setup \
+		</dev/null >/tmp/android-init.log 2>&1 &
+	log "init pid $!"
+	;;
+switch)
+	# The loader cleanly shuts down stock ADSP before kexec.  Acquire it again
+	# through the normal subsystem/PAS API before Android class-main starts;
+	# otherwise adsprpcd starts with no RPMSG transport and never triggers PIL.
+	if [ -f /bin/qkx-adsp-hold.ko ] && ! grep -q '^adsp_hold ' /proc/modules; then
+		# Android init normally mounts modem_a at vendor/firmware_mnt, but
+		# that is too late for this pre-init request. Use the pinned, verified
+		# copy qkx-mount-os already reconstructed at /dev/qkx/modemfw instead
+		# of the real partition -- modem_a itself is never opened here.
+		if [ -b /dev/qkx/modemfw ]; then
+			mkdir -p /tmp/qkx-fw
+			mount -o ro -t vfat /dev/qkx/modemfw /tmp/qkx-fw
+			echo -n /tmp/qkx-fw/image > /sys/module/firmware_class/parameters/path
+			log 'starting ADSP through subsystem_get'
+			insmod /bin/qkx-adsp-hold.ko
+			echo -n '' > /sys/module/firmware_class/parameters/path
+			umount /tmp/qkx-fw
+		else
+			log 'no pinned modemfw image (run tools/os-install-modemfw.sh); skipping early ADSP boot'
+		fi
+	fi
+	# Stand in for the bootloader's continuous splash: bind the panel
+	# pipeline and drop DRM master before Android's composer opens the card,
+	# so the composer becomes master and Oculus's runtime finds the panel
+	# bound, as on a normal boot.
+	if [ -x /bin/qkx-splash ] && [ -e /dev/dri/card0 ]; then
+		setsid /bin/qkx-splash 180 </dev/null >/dev/kmsg 2>&1 &
+		sleep 2
+	fi
+	log 'asking PID 1 to switch root; reconnect telnet in a few seconds'
+	sync
+	touch /tmp/qkx-launch
+	;;
+*)
+	echo "usage: qkx-launch-android [chroot|switch]"
+	exit 1
+	;;
+esac

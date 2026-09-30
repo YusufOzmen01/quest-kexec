@@ -1,7 +1,10 @@
 #!/bin/busybox sh
-# RAM-only init: USB Ethernet (ECM) gadget with a BusyBox telnet shell.
-# The headset is 10.42.0.2; udhcpd hands the host 10.42.0.1.
-# Nothing here mounts a block device.
+# Init for the kexec target: USB Ethernet (ECM) gadget with a BusyBox telnet
+# shell. The headset is 10.42.0.2; udhcpd hands the host 10.42.0.1.
+#
+# If /etc/qkx/maps is present this also assembles a custom Android under
+# /android, but never starts it: it leaves a shell so a broken boot stays
+# debuggable. Run qkx-launch-android when ready.
 export PATH=/bin:/sbin
 export HOME=/root
 export TERM=vt100
@@ -68,8 +71,31 @@ option lease 86400
 EOC
 touch /tmp/udhcpd.leases
 udhcpd /tmp/udhcpd.conf
-telnetd -l /bin/sh -p 23
+# Respawn telnetd: the new OS shares our process table and has killed it before.
+(while :; do telnetd -F -l /bin/sh -p 23; log "telnetd exited ($?); restarting"; sleep 1; done) &
+echo $! > /tmp/telnet.pid
 
 bootdone d
+
+# Keep a full kernel log on hand: the shell arrives long after early boot, and
+# BusyBox dmesg cannot follow the log by itself.
+qkx-klogwatch -f /tmp/kernel.log >/dev/null 2>&1 &
+
+if [ -d /etc/qkx/maps ]; then
+	log 'assembling custom OS'
+	# Keep the transcript: the shell only arrives after this has run. Avoid a
+	# pipeline so the exit status is qkx-mount-os's own.
+	qkx-mount-os >/tmp/mount-os.log 2>&1
+	status=$?
+	cat /tmp/mount-os.log
+	if [ $status -eq 0 ]; then
+		log 'custom OS mounted at /android; run qkx-launch-android to start it'
+	else
+		log "qkx-mount-os failed (status $status); see /tmp/mount-os.log"
+	fi
+fi
+
 log "ready: telnet 10.42.0.2"
-while :; do sleep 3600; done
+# Only PID 1 may switch_root, so qkx-launch-android asks this loop to do it.
+while [ ! -e /tmp/qkx-launch ]; do sleep 1; done
+exec qkx-switch

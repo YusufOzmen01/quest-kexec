@@ -1,0 +1,42 @@
+#!/bin/busybox sh
+# Rewrite the vendor fstab for a pre-mounted, unencrypted boot.
+#
+# The stock fstab expects logical partitions verified by AVB and an encrypted
+# /data unlocked through Keymaster. We already mounted those from images, and we
+# cannot reproduce the encryption, so those entries are dropped or relaxed.
+#
+# Device-specific entries (persist, modem firmware, spunvm, usbotg) are kept
+# untouched so the new OS mounts them from the real hardware.
+#
+# The rewritten file is bind-mounted over the read-only original.
+set -e
+
+ROOT=${1:-/android}
+HW=$(sed -n 's/.*androidboot.hardware=\([^ ]*\).*/\1/p' /proc/cmdline)
+[ -n "$HW" ] || HW=seacliff
+SRC="$ROOT/vendor/etc/fstab.$HW"
+NEW="/tmp/fstab.$HW"
+
+log() { echo "qkx-fstab: $*"; }
+
+[ -f "$SRC" ] || { log "no $SRC"; exit 1; }
+
+# Drop the entries we pre-mount, and /metadata so the new OS keeps to its tmpfs
+# instead of writing to the stock OS's key storage.
+awk '
+	$2 == "/system" || $2 == "/system_ext" || $2 == "/vendor" ||
+	$2 == "/odm" || $2 == "/product" || $2 == "/metadata" {
+		print "# qkx: pre-mounted or withheld -- " $0
+		next
+	}
+	$2 == "/data" {
+		print "# qkx: replaced -- " $0
+		print "/dev/qkx/data /data ext4 noatime,nosuid,nodev wait,nofail"
+		next
+	}
+	{ print }
+' "$SRC" > "$NEW"
+
+mount --bind "$NEW" "$SRC"
+log "patched $SRC"
+grep -E '^(/dev|[a-z])' "$SRC" | awk '{ printf "  %-22s %s\n", $2, $1 }'

@@ -1,0 +1,114 @@
+#!/bin/busybox sh
+# Run by PID 1 (init.sh) when qkx-launch-android asks for it: make the system
+# image the real root and hand PID 1 to Android's init, as on a normal boot.
+#
+# The initramfs is emptied by switch_root, so the debug services are restarted
+# from a BusyBox copy on the new root's /dev tmpfs (second-stage init leaves /dev
+# mounted) and chrooted there, which keeps them working after the root moves.
+ROOT=/android
+Q=/dev/.qkx
+
+log() { echo "qkx-switch: $*"; }
+
+mkdir -p "$ROOT$Q/bin"
+cp /bin/busybox "$ROOT$Q/busybox"
+chroot "$ROOT" $Q/busybox --install -s $Q/bin
+cp /bin/qkx-klogwatch "$ROOT$Q/bin/"
+cat > "$ROOT$Q/bin/qkx-logrun" <<'EOF'
+#!/dev/.qkx/busybox sh
+mkdir -p /data/qkx
+# /dev/kmsg readers begin at the oldest record. Drop the already captured boot
+# backlog so a slow single-CPU run records the impending failure, not 2 MiB of
+# historical messages. The independent retained-RAM console is unaffected.
+/dev/.qkx/busybox dmesg -c >/dev/null
+: > /data/qkx/kernel-current.raw
+echo "qkx logger started $(date)" >> /data/qkx/kernel-current.raw
+/dev/.qkx/busybox cat /dev/kmsg >> /data/qkx/kernel-current.raw &
+while :; do
+	/dev/.qkx/busybox sync
+	/dev/.qkx/busybox sleep 2
+done
+EOF
+cat > "$ROOT$Q/bin/qkx-waitlog" <<'EOF'
+#!/dev/.qkx/busybox sh
+# Started after the staging mount is gone; wait for Android's mount_all.
+while ! awk '$2 == "/data" { found=1 } END { exit !found }' /proc/mounts; do
+	/dev/.qkx/busybox sleep 1
+done
+exec /dev/.qkx/bin/qkx-logrun
+EOF
+chmod 755 "$ROOT$Q/bin/qkx-logrun" "$ROOT$Q/bin/qkx-waitlog"
+# Command helpers for the new root, e.g. returning to stock Android.
+cat > "$ROOT$Q/profile" <<EOF
+export PATH=$Q/bin:/system/bin:/vendor/bin
+export ENV=$Q/profile
+PS1='qkx-android# '
+EOF
+
+# Replace the initramfs telnetd and log watcher with chrooted copies.
+kill $(cat /tmp/telnet.pid) 2>/dev/null
+pkill -f qkx-klogwatch 2>/dev/null
+pkill telnetd 2>/dev/null
+sleep 1
+chroot "$ROOT" $Q/busybox env PATH=$Q/bin ENV=$Q/profile \
+	$Q/busybox sh -c "while :; do telnetd -F -l $Q/bin/sh -p 23; sleep 1; done" \
+	</dev/null >/dev/null 2>&1 &
+chroot "$ROOT" $Q/busybox env PATH=$Q/bin \
+	$Q/bin/qkx-klogwatch -f $Q/kernel.log </dev/null >/dev/null 2>&1 &
+# Stream /dev/kmsg to the host over UDP (tools/klog-udp.py). Needs neither
+# /data nor a live TCP session, so it covers the window before Android's disk
+# logger starts. A restarted reader replays the backlog; the host dedups by
+# sequence number.
+chroot "$ROOT" $Q/busybox sh -c \
+	"while :; do $Q/busybox cat /dev/kmsg | $Q/busybox nc -u 10.42.0.1 5140; $Q/busybox sleep 1; done" \
+	</dev/null >/dev/null 2>&1 &
+# netd replaces the routing policy with fwmark rules that send everything not
+# on an Android-managed network to an unreachable table, which silently cuts
+# the rescue ECM link about 70 ms after it starts. Keep a higher-priority rule
+# for the rescue subnet; netd may flush it, so re-add it every second.
+cat > "$ROOT$Q/bin/qkx-keepnet" <<'EOF'
+#!/dev/.qkx/busybox sh
+# Re-assert every piece of the rescue usb0 path each second: Android's netd
+# may take the link down, drop the address, reorder policy rules or add
+# firewall chains. Each step is idempotent. Log the first time each repair is
+# needed so the persistent log shows what Android changed.
+B=/dev/.qkx/busybox
+IPT=/system/bin/iptables
+note() { grep -q "$1" /dev/.qkx/keepnet.seen 2>/dev/null ||
+	{ echo "$1" >> /dev/.qkx/keepnet.seen; echo "qkx-keepnet: repaired $1" > /dev/kmsg; }; }
+while :; do
+	$B ip link show usb0 | $B grep -q ',UP' || { $B ip link set usb0 up; note link; }
+	$B ip -4 addr show usb0 | $B grep -q 10.42.0.2 ||
+		{ $B ip addr add 10.42.0.2/24 dev usb0; note addr; }
+	$B ip route show table main | $B grep -q '10.42.0.0/24' ||
+		{ $B ip route add 10.42.0.0/24 dev usb0 table main; note route; }
+	for r in 'from 10.42.0.0/24' 'to 10.42.0.0/24'; do
+		$B ip rule show | $B grep -q "$r lookup main" ||
+			{ $B ip rule add $r lookup main pref 50; note "rule $r"; }
+	done
+	if [ -x $IPT ]; then
+		$IPT -w -C INPUT -i usb0 -j ACCEPT 2>/dev/null ||
+			{ $IPT -w -I INPUT 1 -i usb0 -j ACCEPT 2>/dev/null && note ipt-in; }
+		$IPT -w -C OUTPUT -o usb0 -j ACCEPT 2>/dev/null ||
+			{ $IPT -w -I OUTPUT 1 -o usb0 -j ACCEPT 2>/dev/null && note ipt-out; }
+	fi
+	$B sleep 1
+done
+EOF
+chmod 755 "$ROOT$Q/bin/qkx-keepnet"
+chroot "$ROOT" $Q/bin/qkx-keepnet </dev/null >/dev/null 2>&1 &
+# qkx-mount-os mounts data so the rescue shell can inspect it. Android's
+# mount_all must mount it itself: leaving it mounted makes fs_mgr run e2fsck on
+# a live filesystem and then continue after EBUSY. The retained kernel ring is
+# used for post-mortem logging during system-as-root runs.
+sync
+if ! umount "$ROOT/data"; then
+	log 'refusing switch: could not unmount staged data image'
+	exit 1
+fi
+# Android starts qkx-logrun from the generated post-fs-data rc.
+# udhcpd keeps running from the old root; it only needs its open files.
+
+log 'switching root to the system image; Android init takes PID 1'
+cd /
+exec switch_root "$ROOT" /system/bin/init selinux_setup

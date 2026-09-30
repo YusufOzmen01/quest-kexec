@@ -1,0 +1,28 @@
+#!/bin/busybox sh
+# Bind-mount edited copies of files from the read-only OS images.
+#
+# Meta's init scripts live on images we mount read-only, so edits go into
+# /data/qkx/overrides mirroring the absolute path, e.g.
+#   /data/qkx/overrides/vendor/etc/init/hw/init.seacliff.rc
+# replaces /vendor/etc/init/hw/init.seacliff.rc for the next launch.
+#
+# Use qkx-edit <path> to seed a file from the original.
+set -e
+
+ROOT=${1:-/android}
+OVR="$ROOT/data/qkx/overrides"
+
+log() { echo "qkx-override: $*"; }
+
+[ -d "$OVR" ] || exit 0
+
+find "$OVR" -type f | while read -r src; do
+	rel=${src#"$OVR"}
+	dst="$ROOT$rel"
+	if [ ! -e "$dst" ]; then
+		log "skipping $rel (no such file in the OS)"
+		continue
+	fi
+	mount --bind "$src" "$dst"
+	log "applied $rel"
+done

@@ -1,0 +1,129 @@
+#!/bin/busybox sh
+# Assemble the custom Android OS under /android, without touching the stock OS.
+#
+# The OS images live in pinned files on userdata, whose raw blocks we stitch back
+# together with dm-linear. Device-specific partitions (persist, modem firmware,
+# spunvm) are left to Android's own fstab so they come from the real hardware.
+#
+# /metadata is deliberately a tmpfs: the real one holds the stock OS's
+# encryption keys, and the new OS must never write there.
+set -e
+
+ROOT=/android
+CFG=/etc/qkx
+IMAGES="system system_ext vendor odm product data"
+# modemfw is a pinned, verified copy of modem_a (holds the ADSP/CDSP firmware
+# images); reconstructed here like the others but left unmounted until
+# qkx-launch-android needs it, so the real modem_a partition is never touched.
+[ -s "$CFG/maps/modemfw.map" ] && IMAGES="$IMAGES modemfw"
+
+log() { echo "qkx-mount: $*"; }
+
+byname() {
+	awk -v n="$1" '$1 == n { print $2; found = 1 } END { exit !found }' \
+		"$CFG/partitions"
+}
+
+# The partition map records Android's paths, but here only devtmpfs exists, which
+# uses /dev/<name> and has no /dev/block hierarchy or by-name symlinks. Fall back
+# to creating the node from sysfs so the name in the map is all we rely on.
+resolve_dev() {
+	base=${1##*/}
+	for p in "/dev/$base" "/dev/block/$base"; do
+		[ -b "$p" ] && { echo "$p"; return 0; }
+	done
+	if [ -r "/sys/class/block/$base/dev" ]; then
+		mm=$(cat "/sys/class/block/$base/dev")
+		mkdir -p /dev/block
+		if mknod "/dev/block/$base" b "${mm%:*}" "${mm#*:}"; then
+			echo "/dev/block/$base"
+			return 0
+		fi
+	fi
+	return 1
+}
+
+USERDATA=$(byname userdata) || { log 'no userdata in partition map'; exit 1; }
+USERDATA=$(resolve_dev "$USERDATA") || { log 'cannot find the userdata device'; exit 1; }
+
+if [ -e "$ROOT/system/bin/init" ]; then
+	log 'already mounted'
+	exit 0
+fi
+
+# device-mapper's control node is not created by devtmpfs.
+if [ ! -e /dev/mapper/control ]; then
+	mkdir -p /dev/mapper
+	mknod /dev/mapper/control c 10 \
+		"$(awk '$2 == "device-mapper" { print $1 }' /proc/misc)"
+fi
+
+log "userdata is $USERDATA"
+mkdir -p /dev/qkx "$ROOT"
+
+for name in $IMAGES; do
+	[ -s "$CFG/maps/$name.map" ] || { log "no map for $name"; exit 1; }
+	if [ -e "/dev/qkx/$name" ]; then
+		continue
+	fi
+	set -- $(qkx_dm create "qkx-$name" "$USERDATA" "$CFG/maps/$name.map")
+	mknod "/dev/qkx/$name" b "$1" "$2"
+	log "$name: $(( $3 / 1024 / 1024 )) MiB via dm-linear"
+done
+
+# system.img is the root filesystem; everything else mounts inside it.
+log 'mounting root (system)'
+mount -o ro -t ext4 /dev/qkx/system "$ROOT"
+[ -e "$ROOT/system/bin/init" ] || { log 'system image has no /system/bin/init'; exit 1; }
+
+for name in system_ext vendor odm product; do
+	mkdir -p "$ROOT/$name" 2>/dev/null || true
+	log "mounting $name"
+	mount -o ro -t ext4 "/dev/qkx/$name" "$ROOT/$name"
+done
+
+log 'mounting data'
+mount -o rw,noatime -t ext4 /dev/qkx/data "$ROOT/data"
+mkdir -p "$ROOT/data/qkx/overrides"
+
+# Pseudo filesystems that Android's first stage would normally have set up.
+log 'mounting pseudo filesystems'
+mount -t tmpfs -o mode=0755,nosuid tmpfs "$ROOT/dev"
+mkdir -p "$ROOT/dev/pts" "$ROOT/dev/socket"
+mount -t devpts devpts "$ROOT/dev/pts"
+mount -t proc proc "$ROOT/proc"
+mount -t sysfs sysfs "$ROOT/sys"
+[ -d "$ROOT/sys/fs/selinux" ] && mount -t selinuxfs selinuxfs "$ROOT/sys/fs/selinux"
+mount -t tmpfs -o mode=0755 tmpfs "$ROOT/metadata"
+# First-stage init normally puts these writable tmpfs mounts over the read-only
+# system root. We skip first stage, and second stage aborts in
+# SetupMountNamespaces without them.
+for d in linkerconfig apex debug_ramdisk second_stage_resources; do
+	[ -d "$ROOT/$d" ] && mount -t tmpfs -o mode=0755,nodev,nosuid tmpfs "$ROOT/$d"
+done
+mount -t tmpfs -o mode=0755,uid=0,gid=1000,nodev,noexec,nosuid tmpfs "$ROOT/mnt"
+mkdir -p "$ROOT/mnt/vendor" "$ROOT/mnt/product"
+
+# ueventd repopulates /dev, but init and the linker need these immediately.
+mknod "$ROOT/dev/null" c 1 3 && chmod 666 "$ROOT/dev/null"
+mknod "$ROOT/dev/zero" c 1 5 && chmod 666 "$ROOT/dev/zero"
+mknod "$ROOT/dev/random" c 1 8 && chmod 666 "$ROOT/dev/random"
+mknod "$ROOT/dev/urandom" c 1 9 && chmod 666 "$ROOT/dev/urandom"
+mknod "$ROOT/dev/kmsg" c 1 11
+mknod "$ROOT/dev/console" c 5 1
+mknod "$ROOT/dev/ptmx" c 5 2 && chmod 666 "$ROOT/dev/ptmx"
+# Android's /dev is this tmpfs, not the initramfs devtmpfs: give it the
+# device-mapper node (ueventd and apexd race for it during coldboot) and the
+# image nodes the patched fstab points at.
+mknod "$ROOT/dev/device-mapper" c 10 236 && chmod 600 "$ROOT/dev/device-mapper"
+mkdir -p "$ROOT/dev/qkx"
+for n in /dev/qkx/*; do
+	set -- $(stat -c '%t %T' "$n")
+	mknod "$ROOT$n" b $((0x$1)) $((0x$2))
+done
+
+qkx-patch-fstab "$ROOT"
+qkx-patch-usb "$ROOT"
+qkx-apply-overrides "$ROOT"
+
+log 'ready; run qkx-launch-android to start init'

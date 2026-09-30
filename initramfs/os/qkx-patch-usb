@@ -1,0 +1,66 @@
+#!/bin/busybox sh
+# Keep the new OS away from the real USB gadget.
+#
+# Android configures USB through configfs from its rc files, adbd property
+# triggers and the USB HAL binary; binding its gadget replaced our ECM gadget and
+# cut off the debug shell. Rather than chase every writer, the new OS gets a
+# plain tmpfs at /config: its gadget writes succeed there but reach no hardware,
+# and our qkx gadget in the real configfs stays bound.
+#
+# Rewritten rc files are bind-mounted over the read-only originals.
+set -e
+
+ROOT=${1:-/android}
+log() { echo "qkx-usb: $*"; }
+
+n=0
+for rc in "$ROOT"/system/etc/init/hw/*.rc "$ROOT"/vendor/etc/init/hw/*.rc \
+	"$ROOT"/vendor/etc/init/*.rc "$ROOT"/odm/etc/init/*.rc; do
+	[ -f "$rc" ] || continue
+	grep -q 'mount configfs' "$rc" || continue
+	new=/tmp/rc.$n.${rc##*/}
+	sed 's/^\([[:space:]]*\)\(mount configfs .*\)$/\1# qkx: tmpfs instead -- \2/' \
+		"$rc" > "$new"
+	mount --bind "$new" "$rc"
+	log "configfs mount disabled in ${rc#$ROOT}"
+	n=$((n + 1))
+done
+[ $n -gt 0 ] || log 'warning: no configfs mount found in the rc files'
+
+mountpoint -q "$ROOT/config" || mount -t tmpfs -o mode=0755,nodev,noexec,nosuid qkxcfg "$ROOT/config"
+mkdir -p "$ROOT/config/usb_gadget" "$ROOT/config/sdcardfs"
+log "sandbox configfs on ${ROOT}/config"
+
+# Suspects for the power/USB cutoff seen after launch: keep them from starting
+# by hiding their rc files. Override with QKX_KEEP_RC=1 on the kernel cmdline.
+if ! grep -q 'QKX_KEEP_RC=1' /proc/cmdline; then
+	: > /tmp/empty.rc
+	QKX_EXTRA_HIDE=$(sed -n "s/.*qkx_hide=\([^ ]*\).*/\1/p" /proc/cmdline | tr , " ")
+	for rc in vendor/etc/init/hvdcp_opti.rc odm/etc/init/charging_accessory_service.rc \
+		odm/etc/init/android.hardware.usb-service.rc \
+		system_ext/etc/init/init.trackingmisc.rc \
+		system_ext/etc/init/init.vision.rc \
+		$QKX_EXTRA_HIDE; do
+		[ -f "$ROOT/$rc" ] || continue
+		mount --bind /tmp/empty.rc "$ROOT/$rc"
+		log "disabled /$rc"
+	done
+fi
+
+# Android-managed fallback logger. The executable is staged in /dev/.qkx by
+# qkx-switch before second-stage init starts.
+cat > /tmp/qkx-log.rc <<'EOF'
+service qkx_klog /dev/.qkx/bin/qkx-logrun
+    class core
+    user root
+    group root
+    disabled
+
+on post-fs-data
+    start qkx_klog
+EOF
+if [ -f "$ROOT/system/etc/init/dmesgd.rc" ]; then
+	mount --bind /tmp/qkx-log.rc "$ROOT/system/etc/init/dmesgd.rc"
+	log 'installed Android-managed persistent logger'
+fi
+

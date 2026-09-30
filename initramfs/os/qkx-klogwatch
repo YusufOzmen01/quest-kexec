@@ -1,0 +1,48 @@
+#!/bin/busybox sh
+# Follow the kernel log, which BusyBox's dmesg cannot do (it has no -w).
+#
+#   qkx-klogwatch              follow, showing the buffered log first
+#   qkx-klogwatch -n           follow only messages newer than this moment
+#   qkx-klogwatch -g PATTERN   keep only matching lines
+#   qkx-klogwatch -f FILE      also append everything to FILE
+#
+# /dev/kmsg yields one record per read as "<prio>,<seq>,<usec>,<flags>;<text>"
+# and keeps blocking for new records, which is what makes following possible.
+CUTOFF=-1
+PATTERN=
+OUTFILE=
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	-n)
+		# Drop whatever is already buffered by taking the newest buffered
+		# record's timestamp as the cutoff.
+		CUTOFF=$(dmesg | sed -n 's/^\[ *\([0-9][0-9]*\.[0-9]*\)\].*/\1/p' |
+			tail -1)
+		[ -n "$CUTOFF" ] || CUTOFF=-1
+		;;
+	-g) PATTERN=$2; shift ;;
+	-f) OUTFILE=$2; shift ;;
+	-h|--help) sed -n '3,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	*) echo "qkx-klogwatch: unknown option $1" >&2; exit 1 ;;
+	esac
+	shift
+done
+
+# cat blocks on /dev/kmsg once the buffer is drained, so this follows the log.
+cat /dev/kmsg | awk -v cutoff="$CUTOFF" -v pat="$PATTERN" '
+	{
+		sep = index($0, ";")
+		if (sep) {
+			split(substr($0, 1, sep - 1), f, ",")
+			stamp = f[3] / 1000000
+			text = substr($0, sep + 1)
+		} else {
+			stamp = 0
+			text = $0
+		}
+		if (stamp <= cutoff) next
+		if (pat != "" && text !~ pat) next
+		printf "[%12.6f] %s\n", stamp, text
+		fflush()
+	}' | { [ -n "$OUTFILE" ] && tee -a "$OUTFILE" || cat; }

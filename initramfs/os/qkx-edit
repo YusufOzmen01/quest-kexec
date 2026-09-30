@@ -1,0 +1,30 @@
+#!/bin/busybox sh
+# Seed an override from the OS image so it can be edited, e.g.
+#   qkx-edit /vendor/etc/init/hw/init.seacliff.rc
+#   vi /android/data/qkx/overrides/vendor/etc/init/hw/init.seacliff.rc
+#
+# Overrides live on the writable data image, so they survive reboots and are
+# applied by qkx-apply-overrides on the next mount.
+set -e
+
+ROOT=/android
+REL=${1:?usage: qkx-edit <absolute-path-inside-the-new-OS>}
+case "$REL" in
+/*) ;;
+*) echo "qkx-edit: path must be absolute"; exit 1 ;;
+esac
+
+SRC="$ROOT$REL"
+DST="$ROOT/data/qkx/overrides$REL"
+
+[ -f "$SRC" ] || { echo "qkx-edit: $REL is not a file in the mounted OS"; exit 1; }
+
+mkdir -p "${DST%/*}"
+if [ -e "$DST" ]; then
+	echo "qkx-edit: $DST already exists; leaving it alone"
+else
+	cp "$SRC" "$DST"
+	echo "qkx-edit: copied $REL"
+fi
+echo "edit: $DST"
+echo "then: qkx-apply-overrides   (or reboot the target) before qkx-launch-android"
