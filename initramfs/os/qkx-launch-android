@@ -16,6 +16,13 @@
 # rest of the normal sequence: it loads sepolicy and then execs second_stage.
 set -e
 
+# The caller's telnet session may time out before the ADSP and splash steps finish.
+if [ -z "$QKX_DETACHED" ]; then
+	QKX_DETACHED=1 setsid "$0" "$@" </dev/null >/dev/kmsg 2>&1 &
+	echo 'qkx-launch: running detached; output in kernel log'
+	exit 0
+fi
+
 ROOT=/android
 MODE=${1:-switch}
 
@@ -58,9 +65,13 @@ switch)
 	# so the composer becomes master and Oculus's runtime finds the panel
 	# bound, as on a normal boot.
 	if [ -x /bin/qkx-splash ] && [ -e /dev/dri/card0 ]; then
+		# The panel only lights on the second bring-up: run once for a second, then again.
+		/bin/qkx-splash 1 </dev/null >/dev/kmsg 2>&1
+		sleep 1
 		setsid /bin/qkx-splash 180 </dev/null >/dev/kmsg 2>&1 &
 		sleep 2
 	fi
+	[ -n "$QKX_SWITCH_DELAY" ] && sleep "$QKX_SWITCH_DELAY"
 	log 'asking PID 1 to switch root; reconnect telnet in a few seconds'
 	sync
 	touch /tmp/qkx-launch
