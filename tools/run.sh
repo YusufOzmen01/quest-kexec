@@ -6,18 +6,27 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 P=$1; shift
 T=/data/local/tmp
-MOD=$HERE/module/quest_kexec.ko
+MOD=${QKX_LOADER_MODULE:-$HERE/module/quest_kexec.ko}
+MARKER=${QKX_MARKER_MODULE:-$HERE/module/marker_read.ko}
 PARAMS="execute=1 preserve_watchdog=1 watchdog_recovery=0 core_hang_control=2 \
 flush_rpmh=1 suspend_syncboss=1 disconnect_qmp=0 phase_delay_ms=300 $*"
 
-for f in "$MOD" "$HERE/module/marker_read.ko" "$P/Image" "$P/initramfs" "$P/boot.dtb"; do
+for f in "$MOD" "$MARKER" "$P/Image" "$P/initramfs" "$P/boot.dtb"; do
 	[ -f "$f" ] || { echo "missing $f"; exit 1; }
 done
+INITRD=$P/initramfs
+PRIVATE_INITRD=
+if [ -f "$P/require-stock-calibration" ] || [ "${QKX_INHERIT_CALIBRATION:-0}" = 1 ]; then
+	PRIVATE_INITRD=$(mktemp)
+	trap 'rm -f "$PRIVATE_INITRD"' EXIT
+	python3 "$HERE/tools/stock-calibration-initramfs.py" "$INITRD" "$PRIVATE_INITRD" || exit 1
+	INITRD=$PRIVATE_INITRD
+fi
 # Stock hyp-assigns secure ION pages to other VMs; they stay locked after
 # kexec and any access from the next kernel hangs the CPU. Collect them as
 # late as possible and hand them over as one no-map reserved-memory node.
 DTB=$P/boot.dtb
-SECMAP=$HERE/module/ion_secmap.ko
+SECMAP=${QKX_SECMAP_MODULE:-$HERE/module/ion_secmap.ko}
 if [ -f "$SECMAP" ]; then
 	adb push "$SECMAP" $T/ion_secmap.ko >/dev/null
 	# Preserve Android's live hardware state by default. Stopping services
@@ -72,13 +81,33 @@ EOF
 	echo "reserved $(wc -l < "$P/ionsec.txt") secure ranges as $(($(echo $REG | wc -w) / 4)) blocks"
 fi
 
+# The appended calibration archive changes the initrd length. Keep /chosen
+# consistent with the verified bytes staged by the loader.
+if [ -n "$PRIVATE_INITRD" ]; then
+	if [ "$DTB" = "$P/boot.dtb" ]; then
+		DTB=$(mktemp --suffix=.dtb)
+		cp "$P/boot.dtb" "$DTB"
+	fi
+	END=$(python3 - "$DTB" "$INITRD" <<'EOF'
+import pathlib, subprocess, sys
+cells = subprocess.check_output(['fdtget', '-t', 'x', sys.argv[1], '/chosen', 'linux,initrd-start'], text=True).split()
+start = 0
+for c in cells:
+    start = (start << 32) | int(c, 16)
+end = start + pathlib.Path(sys.argv[2]).stat().st_size
+print(hex(end >> 32), hex(end & 0xffffffff))
+EOF
+) || exit 1
+	fdtput -t x "$DTB" /chosen linux,initrd-end $END || exit 1
+fi
+
 adb push "$MOD" $T/qkx.ko >/dev/null
-adb push "$HERE/module/marker_read.ko" $T/qkx_marker.ko >/dev/null
+adb push "$MARKER" $T/qkx_marker.ko >/dev/null
 adb push "$P/Image" $T/qkx-Image >/dev/null
-adb push "$P/initramfs" $T/qkx-initramfs >/dev/null
+adb push "$INITRD" $T/qkx-initramfs >/dev/null
 adb push "$DTB" $T/qkx-boot.dtb >/dev/null
 adb shell 'su -c "sync; sync"'
-for pair in "$MOD:qkx.ko" "$P/Image:qkx-Image" "$P/initramfs:qkx-initramfs" "$DTB:qkx-boot.dtb"; do
+for pair in "$MOD:qkx.ko" "$P/Image:qkx-Image" "$INITRD:qkx-initramfs" "$DTB:qkx-boot.dtb"; do
 	l=${pair%%:*}; r=${pair##*:}
 	[ "$(md5sum < "$l" | cut -d' ' -f1)" = "$(adb shell "su -c 'md5sum $T/$r'" | awk '{print $1}')" ] ||
 		{ echo "hash mismatch: $r"; exit 1; }

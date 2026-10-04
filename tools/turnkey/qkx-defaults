@@ -1,0 +1,59 @@
+#!/system/bin/sh
+# Runs on EVERY alternate boot, including brand-new /data. No stock mounts.
+umask 077
+log() { echo "qkx-defaults: $*" > /dev/kmsg; }
+P=/system_ext/bin/oculuspreferences
+S=/system_ext/bin/oculussetting
+CAL=/dev/qkx-stock-eye-calibration.json
+setprop sys.qkx.defaults pending
+if [ ! -s "$CAL" ]; then
+    setprop sys.qkx.defaults missing_calibration
+    log 'Missing stock calibration handoff; refusing to report tracking ready'
+    exit 1
+fi
+# FirstTimeNux APK is absent, so it cannot race this wait on a new /data.
+# Apply Meta preferences only after user 0 is active and boot completed.
+while [ "$(getprop sys.boot_completed)" != 1 ]; do sleep 2; done
+i=0
+while ! "$P" --getc gaze_input_enabled >/dev/null 2>&1; do
+    i=$((i + 1)); [ "$i" -lt 90 ] || { log 'user-0 preference store unavailable'; exit 1; }
+    sleep 2
+done
+"$S" --user 0 --set first_time_nux_complete 1 || exit 1
+"$S" --user 0 --set first_time_nux_pre_ota_complete 1 || exit 1
+"$S" --user 0 --set first_time_nux_health_safety_complete 1 || exit 1
+"$S" --user 0 --set hand_tracking_opt_in 1 || exit 1
+"$P" --setc gaze_input_enabled 1 debug_eye_gaze_emit_hover_enabled true || exit 1
+calibration=$(cat "$CAL")
+"$P" --setc eye_tracking_calibration "$calibration" >/dev/null || exit 1
+"$S" --user 0 --set eye_tracking_calibration "$calibration" >/dev/null || exit 1
+unset calibration
+settings put global device_provisioned 1 || exit 1
+settings --user 0 put secure user_setup_complete 1 || exit 1
+# Do not synthesize prox_close here: on a pristine profile VrShell handles it
+# by launching an unavailable Guidebook CalibrationNuxActivity and crashes.
+# Launch Home once all NUX/provisioning state is durable. Tracking calibration
+# and ET/FT stabilization can safely finish in the background.
+am start -n com.oculus.vrshell/.HomeActivity >/dev/null || exit 1
+# Restart only tracking after all inputs are durable; leave renderer/system_server alive.
+stop trackingservice
+sleep 2
+start trackingservice
+i=0
+while :; do
+    pid=$(pidof trackingservice)
+    if [ -n "$pid" ] && [ "$(getprop init.svc.trackingservice)" = running ]; then
+        sleep 5
+        [ "$pid" = "$(pidof trackingservice)" ] && break
+    fi
+    i=$((i + 1)); [ "$i" -lt 30 ] || { log 'trackingservice did not stay running'; exit 1; }
+    sleep 2
+done
+unset pid
+i=0
+while ! /system/bin/qkx-faceeye-request 5; do
+    i=$((i + 1)); [ "$i" -lt 90 ] || { log 'ET/FT fidelity request failed'; exit 1; }
+    sleep 2
+done
+setprop sys.qkx.defaults ready
+log 'NUX bypass/provisioning, stock calibration, hand opt-in, gaze and ET/FT applied'

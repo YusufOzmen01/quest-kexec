@@ -10,7 +10,15 @@ and recovery environment. No installed partitions or userdata images changed.
 
 Image: `build/runs/253/Image`
 SHA-256: `5ded7a62459b5cd7d57f79a06e7bb4c6e798df8ead98d4a8c14fe0b187d266a8`.
-Current target: rescue boot `ram12-253repeat`, not Android.
+Current target: full-RAM Android with Venus and CMS/updater disabled,
+`out/ospayload-253-ram12-noupdater`, tag `ram253noupdater`.
+User confirmed visible UI on the earlier combined Venus/full-RAM boot.
+The newest CMS/updater-removal boot completed initialization and a Venus
+encode test; final visibility awaits confirmation. Image replacements require
+fresh maps: prior payload maps are now stale. Fresh low6 rollback:
+`out/ospayload-249-audio-noupdater`. See the working-setup document.
+The archive/run identifier is 253; this Image's emitted kernel build counter
+is #250.
 
 The physical RAM population is 12 GiB, with normal firmware/address-map holes,
 secure VM reservations, kernel metadata and splash reservations unavailable to
@@ -37,8 +45,65 @@ memory must remain excluded. Dynamic secure reservations vary between boots.
 
 This is substantial allocation/read/write validation, not exhaustive testing
 of all bit patterns or long-duration thermal/retention behavior. Android with
-this full map has deliberately NOT been tested. Existing Android payloads and
-image maps were left alone; do not call the Android RAM issue resolved yet.
+this full map has deliberately NOT been tested. Existing baseline Android payloads and image maps were left alone during
+rescue validation. Subsequent Android tests are recorded below; Venus/full-RAM
+coexistence is not yet verified.
+
+## Subsequent Android test (user authorized Android after rescue validation)
+
+- Venus-enabled `out/ospayload-253-ram12`, tag `android253ram12`: gadget gone
+  at 40 s, no completed Android boot established. Retained log shows CPU0
+  soft lockup waiting in cross-CPU synchronization during BPF setup, with
+  another CPU not responding. This is not proof of a DDR fault or a proven
+  Venus root cause.
+- `out/ospayload-253-ram12-novidc`, tag `android253ram12nv`: same full memory
+  map and splash guard, VIDC disabled, alive at 60 s, sys.boot_completed=1.
+  MemTotal 11,786,344 KiB (~11.24 GiB), MemAvailable 9,050,508 KiB at initial
+  check. Bluetooth ON, ALSA audio card registered. Proximity and ET/FT restored,
+  user calibration true/both_temporal verified. No GPU timeout or soft-lockup
+  messages in the subsequent check. Visual rendering awaits user confirmation.
+- No image replacements or installed partition changes for these tests.
+
+## Full-RAM Android success and restored Venus
+
+Initial full-RAM Android rendering was blank and the next reboot soft-locked,
+even with VIDC disabled; low6 rollback restored visible UI. The expanded
+read-only stock snapshot in `module/ion_secmap.c` + `module/smmu_secmap.h`
+then added master-side secure SMMU page tables and cached secure table pools.
+Their private stock layouts are corroborated through public VMID/TTBR attrs,
+and table traversal is serialized with the driver's assignment/table locks.
+Only table pages/pools are read; mapped secure payload pages are not read.
+
+The stock driver shares these pages with HLOS READ|WRITE but no EXEC. Reusing
+them as ordinary executable/JIT RAM after kexec is unsafe, despite passing
+read/write-only tests. The former ION/KGSL-buffer snapshot omitted these table
+pages. The first expanded snapshot found 30 table pages across nine domains:
+GPU, crypto, CVP, display, video and FastRPC. Current loader reserves their
+ranges along with the existing secure ION ranges; no giveback/SCM reassignment.
+This omission is strongly implicated in the Android-specific stalls; not every
+historical CPU/GPU fault has been individually attributed.
+
+- `ram253sharedtables` (VIDC disabled): Android boot complete, user confirmed
+  visible UI. Live Android test allocated 4096 MiB, filled all blocks before
+  verifying, zero mismatches, all pages freed. Boot completion, Bluetooth ON,
+  audio card and stock-imported calibration remained intact afterward.
+- `ram253sharedvenus` and fresh `ram253sharedvenusrepeat`: VIDC enabled with
+  qkx_venus_reload_first=1 and qkx_venus_no_pc=1. Both boots completed Android
+  initialization and each passed three 1080p H.264 hardware encode/decode
+  cycles (300 frames each, EOS=true); detached script STATUS=PASS.
+- Downloaded output `work/venus-test/encoded-ram12-253.mp4`: host ffprobe
+  H.264/1920x1080/300 frames/10 seconds; FFmpeg full decode exit 0.
+- Latest MemTotal 11,774,064 KiB; no GPU timeout, stalled-SMMU or soft-lockup
+  messages in the final checks. CVP firmware still reported a separate NOC
+  error during boot; this is not a Venus test failure and remains open.
+- Visibility on the final combined Venus-enabled boot still needs user
+  confirmation. Long-duration/other-codec/secure-DRM tests remain open.
+- The low-IOMMU-table-allocation diagnostic (#254 archive) did not resolve the
+  stalls, was removed from source, and is not part of this working recipe.
+
+Before reproduction, rebuild/use the expanded stock-compatible ion_secmap
+module as `module/ion_secmap.ko`. It is essential to the Android recipe.
+Historical rescue tests below preceded that snapshot enhancement.
 
 ## Changes needed
 

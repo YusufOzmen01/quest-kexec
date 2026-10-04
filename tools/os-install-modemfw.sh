@@ -13,7 +13,7 @@ set -euo pipefail
 
 OUT=${1:-out/os}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-W=/data/local/tmp/qkx
+W=${QKX_WORK_DIR:-/data/local/tmp/qkx}
 NAME=modemfw
 
 say() { printf '\n== %s\n' "$*"; }
@@ -47,7 +47,9 @@ else
 	sh_ "sh $W/qkx-install.sh write $NAME $W/modemfw-src.img"
 
 	say "$NAME: verifying"
-	sh_ "sh $W/qkx-install.sh verify $NAME $W/modemfw-src.img"
+	verified=$(sh_ "sh $W/qkx-install.sh verify $NAME $W/modemfw-src.img" 2>&1)
+	printf '%s\n' "$verified"
+	grep -q 'qkx_rawcp: verified' <<<"$verified" || { echo 'raw verification failed: modemfw'; exit 1; }
 	sh_ "rm -f $W/modemfw-src.img"
 fi
 

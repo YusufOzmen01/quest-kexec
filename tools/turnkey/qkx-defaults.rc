@@ -1,0 +1,14 @@
+# Alternate-image-only bootstrap; never imported by stock init.
+service qkx-defaults /system/bin/sh /system/bin/qkx-defaults
+    user root
+    group root system shell
+    seclabel u:r:su:s0
+    disabled
+    oneshot
+
+on post-fs-data
+    # Fresh /data lacks this target of the root /vision symlink. Tracking runs
+    # as system:system and aborts if it cannot create /vision/insideout.
+    mkdir /data/misc/vision 0770 system system
+    restorecon_recursive /data/misc/vision
+    start qkx-defaults

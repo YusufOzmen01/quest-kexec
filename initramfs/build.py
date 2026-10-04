@@ -81,6 +81,10 @@ def main():
             raise SystemExit(f"{partitions}: missing; rerun tools/os-install.sh")
         entries.append(("etc/qkx/partitions", stat.S_IFREG | 0o644,
                         partitions.read_bytes(), 0, 0))
+        turnkey = a.os_dir / "qkx-turnkey.json"
+        if turnkey.is_file():
+            entries.append(("etc/qkx/turnkey.json", stat.S_IFREG | 0o600,
+                            turnkey.read_bytes(), 0, 0))
         maps = sorted((a.os_dir / "maps").glob("*.map"))
         if not maps:
             raise SystemExit(f"{a.os_dir}/maps: no extent maps found")

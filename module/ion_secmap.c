@@ -91,6 +91,8 @@ static unsigned long sg_total(struct sg_table *sgt)
 	return n;
 }
 
+#include "smmu_secmap.h"
+
 /* The GPU driver locks its secure buffers to VMID_CP_PIXEL on its own. */
 static void dump_kgsl(void)
 {
@@ -177,6 +179,7 @@ static int __init ion_secmap_init(void)
 	up_read(&idev->lock);
 
 	dump_kgsl();
+	dump_smmu_tables();
 	emit(0, 0);
 	pr_info("ionsec: total %lu KiB\n", total >> 10);
 	filp_close(f, NULL);

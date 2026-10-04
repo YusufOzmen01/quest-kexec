@@ -9,7 +9,8 @@
 # No partition is formatted and nothing outside these files is written.
 set -e
 
-W=/data/local/tmp/qkx
+W=$(dirname "$0")
+case "$W" in /data/local/tmp/qkx*) ;; *) echo 'invalid pinned-file work directory'; exit 1 ;; esac
 BIN=$W/bin
 IMG=$W/img
 MAP=$W/maps

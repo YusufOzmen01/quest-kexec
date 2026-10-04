@@ -122,6 +122,13 @@ for n in /dev/qkx/*; do
 	mknod "$ROOT$n" b $((0x$1)) $((0x$2))
 done
 
+# Private per-launch calibration arrives from the running stock OS, not /data.
+# Keep it on the new /dev tmpfs so it cannot become part of a distributable image.
+if [ -s /qkx-stock-eye-calibration.json ]; then
+	cp /qkx-stock-eye-calibration.json "$ROOT/dev/qkx-stock-eye-calibration.json"
+	chmod 600 "$ROOT/dev/qkx-stock-eye-calibration.json"
+fi
+
 qkx-patch-fstab "$ROOT"
 qkx-patch-usb "$ROOT"
 qkx-apply-overrides "$ROOT"

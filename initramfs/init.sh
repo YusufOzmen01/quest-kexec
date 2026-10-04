@@ -88,7 +88,10 @@ if [ -d /etc/qkx/maps ]; then
 	qkx-mount-os >/tmp/mount-os.log 2>&1
 	status=$?
 	cat /tmp/mount-os.log
-	if [ $status -eq 0 ]; then
+	if [ $status -eq 0 ] && [ -f /etc/qkx/turnkey.json ]; then
+		log 'turnkey OS mounted; launching Android automatically'
+		qkx-launch-android
+	elif [ $status -eq 0 ]; then
 		log 'custom OS mounted at /android; run qkx-launch-android to start it'
 	else
 		log "qkx-mount-os failed (status $status); see /tmp/mount-os.log"

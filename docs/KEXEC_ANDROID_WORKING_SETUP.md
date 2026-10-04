@@ -1,9 +1,13 @@
 # Quest Pro kexec → Android: Working Setup & Fix Log
 
-Status date: 2026-09-30 (device sessions of 2026-08-26..27 in target uptime)
-Current kernel: #243 (Wi-Fi fix; #242 = previous) (`out/captured-low6` capture, SHA-256
-`652176285a16cd8e1e611864537e30c9bf2b5a1fe36bdc4bc69223e4c45c21e0`)
-Current payload: `quest-pro-kexec/out/ospayload-252fpoll`
+Current kernel archive/run: #253 (emitted build counter #250), SHA-256
+`5ded7a62459b5cd7d57f79a06e7bb4c6e798df8ead98d4a8c14fe0b187d266a8`.
+Current payload: `quest-pro-kexec/out/ospayload-253-ram12-noupdater`.
+Latest boot tag: `ram253noupdater`. Full RAM + H.264 hardware codecs validated;
+UI confirmed on the preceding full-RAM/Venus boot. This new boot removes CMS
+and OTA entrypoints; final visibility awaits user confirmation.
+Fresh-map low6 rollback: `out/ospayload-249-audio-noupdater`.
+Older payload maps are stale after the system/system_ext image replacements.
 
 > This file documents the complete recipe that got alternate Android to
 > **visually render**, tracking active, and first-time setup usable without
@@ -398,17 +402,78 @@ Note: the other stock dlkms (audio, usb-net, powerstate_mgr, ...) still fail
 with the same module_layout error; rebuilt versions of all of them are in
 `build/diagnostic-kernel` and can be swapped in the same way if needed.
 
-### Full RAM — validated in rescue only, not yet Android
+### CMS and alternate OS updater — persistently disabled
+
+`com.oculus.os.cm` was disabled-user but still crash-looped; OSUpdater was
+protected from pm disable-user. Both are now removed from the alternate image
+scan paths, together with NuxOta, by quarantining their APKs under the image
+root `/qkx-disabled/*.disabled` (root-only mode 0600). They are not scanned as
+apps. Quarantine also contains original update_engine RC, gold-core RC,
+update_engine, update_engine_client, update_verifier, and postinstall binaries.
+Neither normal nor gold update-engine service is registered, and native OTA
+entrypoints are absent from their original paths. This disables the alternate
+Android OS updater mechanisms; it does NOT modify the stock installation or
+assert that unrelated firmware-update code has been audited.
+
+Backups: `work/system-pre-disable-updater-cm.img` and
+`work/system_ext-pre-disable-updater-cm.img`. Actual system_ext source remains
+`work/no-vision-images/system_ext.img` via the no-usb-images symlink.
+Script: `tools/disable-alt-updaters.py` (workspace-specific paths; refuses to
+overwrite backups). It expands each host image by 256 MiB, unshares ext4
+shared blocks before edits, verifies each quarantined file's SHA-256 against
+its original, and requires a clean final e2fsck. Restore by replacing host
+copies from the backups, reinstalling those two pinned files, and preparing
+fresh payload maps; never write installed partitions.
+
+Install verification: system 1452 MiB, system_ext 1518 MiB, both qkx_rawcp
+verified. `tools/os-install.sh` now resolves image symlinks before stat/staging:
+its former lstat-sized system_ext allocation was wrong. The failed staging
+attempt did not write that image; it was deleted/reallocated before retry.
+Fresh prep rebuilt both full-RAM and low6 payload maps.
+
+After reboot: sys.boot_completed=1; all three packages absent from pm's installed
+package list; no corresponding processes or update-engine services. Explicit
+start attempts for update_engine/update_engine_gold failed, and processes
+remained absent after a successful 60-frame Venus H.264 encode. Bluetooth ON,
+audio card present, proximity and ET/FT fidelity restored. Controllers remain
+intentionally deferred. Current final UI visibility awaits user confirmation.
+
+CVP = Qualcomm Computer Vision Processor, a vision accelerator distinct from
+Venus codecs. Its firmware NOC (Network-on-Chip interconnect) error remains
+open; confirmed tracking/rendering/video successes do not prove CVP is healthy.
+
+### Full RAM — Android UI confirmed; Venus also passes repeated tests
 
 Kernel #253 and `out/ram12-253` register the full 12 GiB physical RAM map.
 Two fresh boots with GPU/display kernel probing enabled passed the corrected
 read scan and 11,008 MiB simultaneous allocation/pattern tests, zero errors.
 The strengthened fill-all-before-verify alias test also passed. Firmware,
 secure VM and kernel reservations leave about 11.25 GiB usable.
-Alternate Android was deliberately never launched for these RAM attempts;
-normal Android payloads still use the conservative low6 map. See
-`KEXEC_RAM_12GB_RESCUE.md` for the splash-reservation guard, scanner fixes,
-exact image hash, reproduction and remaining caveats.
+Initial RAM validation was rescue-only. Subsequent Android test:
+`out/ospayload-253-ram12-novidc`, tag `android253ram12nv`, alive at 60 s,
+sys.boot_completed=1, MemTotal=11,786,344 KiB (~11.24 GiB). Bluetooth ON,
+audio card present, proximity broadcast and ET/FT fidelity request restored;
+user_calibrated=true/both_temporal verified. No GPU timeout/soft-lockup messages
+in the subsequent check. Visual rendering awaits user confirmation.
+Those initial tests were followed by another failed reboot and a confirmed
+low6 rollback. The missing handoff coverage was then addressed: the read-only
+stock `ion_secmap` snapshot now also enumerates master-side secure SMMU tables
+and their secure pools (GPU, display, CVP, video, crypto and FastRPC domains).
+These pages retain HLOS RW, but not EXEC, after stock shares them with a secure
+VM; the previous ION-only snapshot omitted them. Reserve them across kexec,
+never change their ownership. Initial snapshot: 30 table pages in 9 domains.
+With the expanded reservation, full-RAM Android UI was confirmed by the user
+(`ram253sharedtables`). A live 4096 MiB allocator/fill-all/verify test passed
+with zero mismatches; Bluetooth ON, audio card present and calibration intact.
+VIDC was then re-enabled with the established reload-first/no-PC flags:
+`ram253sharedvenus` and fresh `ram253sharedvenusrepeat` both completed Android
+boot and three 1920x1080, 300-frame H.264 encode/decode cycles apiece, EOS=true.
+Host FFmpeg decoded the captured output without errors. Latest MemTotal:
+11,774,064 KiB. UI visibility on the final Venus-enabled boot awaits user
+confirmation. The unsuccessful low-page-table-allocation diagnostic was
+removed; it is not needed by the working configuration.
+The previously verified low6 audio/Venus payload remains available. See
+`KEXEC_RAM_12GB_RESCUE.md` for the full history and safeguards.
 
 ### Audio — audible output confirmed by user on kernel #249
 
@@ -441,9 +506,15 @@ no functional audio-driver patch was necessary. Installed partitions and
 stock userdata were not modified. Gaze fidelity and proximity activation
 were restored after this boot. Changes remain uncommitted.
 
-### Venus H.264 encode/decode — VERIFIED on kernel #249
+### Venus H.264 encode/decode — verified on low6 #249 and full-RAM run #253
 
-Current Venus payload: `out/ospayload-249-venus`.
+Current combined payload: `out/ospayload-253-ram12-venus` (full RAM,
+expanded stock secure-table reservation, same Venus reload-first/no-PC flags).
+Six 1080p/300-frame encode/decode cycles passed across two fresh boots.
+Independent host output: `work/venus-test/encoded-ram12-253.mp4` (FFmpeg exit 0).
+Detached completion-driven test: `tools/tests/venus/ram12-check.sh`;
+wait for an actual `STATUS=PASS` line, not an echoed shell command.
+The historical low6 test payload was `out/ospayload-249-venus`.
 Kernel: `build/runs/249/Image`, SHA-256
 `a5b35a9a8fa6584e629fe36a77cda526e4d7ff7bfd8baec59a88b52703cfb5a0`.
 Build and launch from `quest-pro-kexec` using:

@@ -23,4 +23,9 @@ python3 "$HERE/initramfs/build.py" --busybox "$BB" --output "$RD" \
 # keeps SELinux permissive so the debug shell survives init's policy load.
 "$HERE/tools/prep.sh" "$C" "$IMG" "$RD" "$OUT" androidboot.selinux=permissive qkx_selinux_permissive=1 \
 	hung_task_panic=1 hung_task_timeout_secs=30 softlockup_panic=1 audit=0 ${QKX_EXTRA_CMDLINE:-}
+if [ -f "$OSDIR/qkx-turnkey.json" ]; then
+	touch "$OUT/require-stock-calibration"
+else
+	rm -f "$OUT/require-stock-calibration"
+fi
 echo "payload with custom OS ready: $OUT"
