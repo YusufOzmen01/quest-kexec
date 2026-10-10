@@ -4,6 +4,7 @@
 # Revalidation only: ./qkx-install-package.sh --verify-only ZIP
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/tools/board.sh"
 VERIFY_ONLY=0
 if [ "${1:-}" = --verify-only ]; then VERIFY_ONLY=1; shift; fi
 ZIP=${1:-}
@@ -39,7 +40,7 @@ verify_zip "$ZIP"
 [ "$VERIFY_ONLY" = 0 ] || exit 0
 adb shell 'su -c id' </dev/null | grep -q 'uid=0' || { echo 'Rooted adb is required'; exit 1; }
 MODEL=$(adb shell getprop ro.product.device </dev/null | tr -d '\r')
-[ "$MODEL" = seacliff ] || { echo "Refusing non-Quest-Pro device: $MODEL"; exit 1; }
+qkx_board_load "$MODEL" || { echo "Refusing unsupported device: $MODEL"; exit 1; }
 read -r -p 'Alternate /data size in GiB [16]: ' DATA_GIB
 DATA_GIB=${DATA_GIB:-16}
 [[ "$DATA_GIB" =~ ^[0-9]+$ ]] && [ "$DATA_GIB" -ge 4 ] && [ "$DATA_GIB" -le 128 ] || { echo 'Choose 4..128 GiB'; exit 1; }
