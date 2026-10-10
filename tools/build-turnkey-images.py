@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+from board import load_board
 
 HERE = Path(__file__).resolve().parent
 NAMES = ('system', 'system_ext', 'vendor', 'odm', 'product')
@@ -15,8 +16,7 @@ REMOVE = {
  'system': ['/system/etc/init/update_engine.rc', '/system/bin/update_engine',
             '/system/bin/update_engine_client', '/system/bin/update_verifier', '/system/bin/postinstall'],
  'system_ext': ['/etc/init/update_engine_gold.rc', '/priv-app/OSUpdater/OSUpdater.apk',
-                '/priv-app/NuxOta/NuxOta.apk', '/priv-app/CMSHeadset/CMSHeadset.apk',
-                '/priv-app/FirstTimeNuxSeacliff/FirstTimeNuxSeacliff.apk'],
+                '/priv-app/NuxOta/NuxOta.apk', '/priv-app/CMSHeadset/CMSHeadset.apk'],
 }
 
 
@@ -64,7 +64,14 @@ def main():
     ap.add_argument('source', type=Path)
     ap.add_argument('output', type=Path)
     ap.add_argument('--faceeye-request', type=Path, required=True)
+    ap.add_argument('--board', default='seacliff')
     a = ap.parse_args()
+    board = load_board(a.board)
+    # The first-time-setup APK is board-specific; quarantine it with the rest.
+    remove = {k: list(v) for k, v in REMOVE.items()}
+    nux = board['QKX_NUX_APK']
+    if nux:
+        remove['system_ext'].append(f'/priv-app/{nux}/{nux}.apk')
     if a.output.exists():
         raise SystemExit('Refusing to overwrite output directory')
     for n in NAMES:
@@ -83,16 +90,16 @@ def main():
             image = a.output / (n + '.img')
             run('cp', '--reflink=auto', '--sparse=always', str(src), str(image))
             manifest['source_images'][n] = str(src)
-            if n in REMOVE or n == 'product':
+            if n in remove or n == 'product':
                 with image.open('r+b') as f:
                     f.truncate(image.stat().st_size + (64 << 20))
                 fsck(image, '-fy')
                 run('resize2fs', str(image))
                 fsck(image, '-fy', '-E', 'unshare_blocks')
-                if n in REMOVE:
+                if n in remove:
                     if not exists(image, '/qkx-disabled'):
                         debug(image, 'mkdir /qkx-disabled', True)
-                    for path in REMOVE[n]:
+                    for path in remove[n]:
                         if not exists(image, path):
                             continue  # Already quarantined by the baseline.
                         original = tmp / 'original'
