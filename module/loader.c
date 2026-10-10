@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Experimental Quest Pro ARM64 kexec module. Insertion stages by default.
+/* Experimental Meta Quest (Kona) ARM64 kexec module. Insertion stages by default.
  * All inputs are regular files directly under /data/local/tmp.
  * No partition/file writes and no sysfs command interface.
  */
@@ -1136,4 +1136,4 @@ static void __exit qkx_exit(void)
 module_init(qkx_init);
 module_exit(qkx_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Experimental Quest Pro ARM64 kexec staging and EL1 transition");
+MODULE_DESCRIPTION("Experimental Meta Quest (Kona) ARM64 kexec staging and EL1 transition");
