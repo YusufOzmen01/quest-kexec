@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Experimental Quest Pro ARM64 kexec module. Insertion stages by default.
+/* Experimental Meta Quest (Kona) ARM64 kexec module. Insertion stages by default.
  * All inputs are regular files directly under /data/local/tmp.
  * No partition/file writes and no sysfs command interface.
  */
@@ -64,6 +64,7 @@ static bool warm_reset_test;
 static bool flush_rpmh;
 static bool suspend_syncboss;
 static bool disconnect_qmp;
+static char *syncboss_spi = "spi0.0";
 module_param(image, charp, 0);
 module_param(initrd, charp, 0);
 module_param(dtb, charp, 0);
@@ -85,7 +86,9 @@ MODULE_PARM_DESC(warm_reset_test, "Force the running Android kernel's Qualcomm w
 module_param(flush_rpmh, bool, 0);
 MODULE_PARM_DESC(flush_rpmh, "Call the exported rpmh_flush() on the apps RSC before the final jump, mirroring the cluster-idle-enter path so the RSC hardware isn't left with stale active-set state across kexec");
 module_param(suspend_syncboss, bool, 0);
-MODULE_PARM_DESC(suspend_syncboss, "Suspend spi0.0 syncboss through its PM callback before kexec, stopping active GPI DMA");
+MODULE_PARM_DESC(suspend_syncboss, "Suspend the syncboss MCU (see syncboss_spi) through its PM callback before kexec, stopping active GPI DMA");
+module_param(syncboss_spi, charp, 0);
+MODULE_PARM_DESC(syncboss_spi, "SPI device name of the syncboss MCU (board-specific: spi0.0 on seacliff, spi1.0 on hollywood)");
 module_param(disconnect_qmp, bool, 0);
 MODULE_PARM_DESC(disconnect_qmp, "Cleanly close Android AOP QMP channels and publish mcore LINK_DOWN before kexec");
 MODULE_PARM_DESC(core_hang_control, "0: untouched; 1: report secure core-hang registers; 2: clear enable bit");
@@ -673,7 +676,7 @@ static int __maybe_unused qkx_execute(void)
 	watchdog = find_dev(platform_bus, NULL, "17c10000.qcom,wdt");
 	usb_core = find_dev(platform_bus, NULL, "a600000.dwc3");
 	if (suspend_syncboss)
-		syncboss = find_dev(spi_bus, NULL, "spi0.0");
+		syncboss = find_dev(spi_bus, NULL, syncboss_spi);
 	if (disconnect_qmp)
 		qmp_dev = find_dev(platform_bus, NULL, "c300000.qcom,qmp-aop");
 	if (flush_rpmh)
@@ -1133,4 +1136,4 @@ static void __exit qkx_exit(void)
 module_init(qkx_init);
 module_exit(qkx_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Experimental Quest Pro ARM64 kexec staging and EL1 transition");
+MODULE_DESCRIPTION("Experimental Meta Quest (Kona) ARM64 kexec staging and EL1 transition");

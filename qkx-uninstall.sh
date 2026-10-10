@@ -2,6 +2,8 @@
 # Remove QKX-created files from the headset's userdata. Never touches partitions.
 # Usage: ./qkx-uninstall.sh [--yes] [--keep-legacy]
 set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/tools/board.sh"
 YES=0; LEGACY=1
 while [ $# -gt 0 ]; do
  case "$1" in
@@ -23,7 +25,7 @@ case "$KERNEL" in
  *qkx*) echo "Refusing to uninstall while a QKX kernel is running ($KERNEL). Reboot stock Android first."; exit 1 ;;
 esac
 MODEL=$(adb shell getprop ro.product.device | tr -d '\r')
-[ "$MODEL" = seacliff ] || { echo "Refusing unexpected device: $MODEL"; exit 1; }
+qkx_board_load "$MODEL" || { echo "Refusing unexpected device: $MODEL"; exit 1; }
 # Exact project-owned paths only. Do not use a broad qkx* glob.
 PATHS=(
  /data/local/tmp/qkx-release

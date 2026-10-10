@@ -7,9 +7,14 @@ the qkx-* helper scripts.
 """
 import argparse
 import gzip
+import shlex
 import stat
 import struct
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from board import load_board
 
 
 def archive(entries):
@@ -36,6 +41,16 @@ def check_static_arm64(path):
     return b
 
 
+def init_with_board(path, manufacturer):
+    """Read the init script and bake in the board's USB manufacturer string."""
+    text = path.read_text()
+    inject = f"QKX_USB_MANUFACTURER={shlex.quote(manufacturer)}\n"
+    if text.startswith("#!") and "\n" in text:
+        nl = text.index("\n") + 1
+        return (text[:nl] + inject + text[nl:]).encode()
+    return (inject + text).encode()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--busybox", type=Path, required=True)
@@ -51,14 +66,17 @@ def main():
     ap.add_argument("--qkx-dm", type=Path,
                     help="static qkx_dm binary, required with --os-dir")
     ap.add_argument("--max-size", type=lambda s: int(s, 0), default=0x200000)
+    ap.add_argument("--board", default="seacliff")
     a = ap.parse_args()
+    board = load_board(a.board)
     dirs = ["bin", "sbin", "dev", "dev/pts", "proc", "sys", "config", "etc", "root", "tmp"]
     if a.os_dir:
         dirs += ["etc/qkx", "etc/qkx/maps", "android"]
     entries = [(d, stat.S_IFDIR | 0o755, b"", 0, 0) for d in dirs]
     entries += [
         ("bin/busybox", stat.S_IFREG | 0o755, check_static_arm64(a.busybox), 0, 0),
-        ("init", stat.S_IFREG | 0o755, a.init.read_bytes(), 0, 0),
+        ("init", stat.S_IFREG | 0o755,
+         init_with_board(a.init, board["QKX_USB_MANUFACTURER"] or "quest-pro-kexec"), 0, 0),
         ("dev/console", stat.S_IFCHR | 0o600, b"", 5, 1),
         ("dev/kmsg", stat.S_IFCHR | 0o600, b"", 1, 11),
         ("dev/null", stat.S_IFCHR | 0o666, b"", 1, 3),
