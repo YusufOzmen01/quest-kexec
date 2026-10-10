@@ -6,8 +6,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 KEYS = ('QKX_BOARD', 'QKX_BOARD_LABEL', 'QKX_USB_MANUFACTURER', 'QKX_SYNCBOSS_SPI',
-        'QKX_SPLASH_NODE', 'QKX_SPLASH_BASE', 'QKX_SPLASH_SIZE', 'QKX_DISABLE_NODES',
-        'QKX_NUX_APK', 'QKX_KERNEL_LOCALVERSION')
+        'QKX_NUX_APK', 'QKX_KERNEL_LOCALVERSION', 'QKX_DISABLE_NODES', 'QKX_NOMAP_NODES')
 
 
 def load_board(name):

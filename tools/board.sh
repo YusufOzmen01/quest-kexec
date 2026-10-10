@@ -52,8 +52,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 		{ echo "board: could not determine the board (no argument and no device)" >&2; exit 1; }
 	qkx_board_load "$name"
 	echo "board: $QKX_BOARD ($QKX_BOARD_LABEL)"
-	for k in QKX_USB_MANUFACTURER QKX_SYNCBOSS_SPI QKX_SPLASH_NODE QKX_SPLASH_BASE \
-		QKX_SPLASH_SIZE QKX_DISABLE_NODES QKX_NUX_APK QKX_KERNEL_LOCALVERSION; do
+	for k in QKX_USB_MANUFACTURER QKX_SYNCBOSS_SPI QKX_NUX_APK QKX_KERNEL_LOCALVERSION \
+		QKX_DISABLE_NODES QKX_NOMAP_NODES; do
 		printf '  %s=%s\n' "$k" "${!k:-}"
 	done
 fi

@@ -29,6 +29,10 @@ chip, so the majority of the module needs no per-board handling:
   is a Kona physical-address choice, not a board choice.
 - The ARM64 `Image` boot contract (text offset `0x80000` and the flag checks in
   `tools/prepare.py:103`) belongs to the architecture, not the board.
+- The reserved-memory and peripheral nodes the Android handoff edits —
+  `cont_splash_region@9c000000`, `secure_display_region`, `qseecom@82400000`,
+  `vidc@aa00000` — are defined in `kona.dtsi` with the same addresses on both
+  boards and no board override, so the install flow treats them as SoC constants.
 
 The loader source already builds unmodified for both boards.
 
@@ -39,11 +43,11 @@ per board:
 
 - the device label and the `ro.product.device` codename it keys off,
 - the syncboss SPI node name,
-- the continuous-splash reserved region (node name, base, size),
-- the `/soc` nodes to disable for a first boot (qseecom, vidc),
 - the first-time-setup APK name,
 - the USB gadget manufacturer string,
-- the kernel `LOCALVERSION` the module build must match.
+- the kernel `LOCALVERSION` the module build must match,
+- the first-boot DTB-prep node lists (status-disabled and force-no-map) — see
+  the note below on why these sit here even though they don't vary on Kona.
 
 These go in one sourceable shell file per board, `boards/<codename>.sh`, written
 as `KEY=VALUE` lines so both the bash tools (`source boards/$dev.sh`) and the
@@ -55,15 +59,23 @@ Python tools (parsing the same file) read a single source of truth. The schema:
 | `QKX_BOARD_LABEL` | display label used in package manifests and device guards |
 | `QKX_USB_MANUFACTURER` | USB gadget manufacturer string set by the initramfs |
 | `QKX_SYNCBOSS_SPI` | syncboss SPI node name passed to the loader (`spi0.0` on seacliff, `spi1.0` on hollywood) |
-| `QKX_SPLASH_NODE` / `QKX_SPLASH_BASE` / `QKX_SPLASH_SIZE` | continuous-splash reserved region marked `no-map` at prep time |
-| `QKX_DISABLE_NODES` | `/soc` nodes disabled for a first boot (qseecom, vidc) |
 | `QKX_NUX_APK` | first-time-setup APK selected by the turnkey image builder |
 | `QKX_KERNEL_LOCALVERSION` | `LOCALVERSION` the module build must match |
+| `QKX_DISABLE_NODES` | DTB nodes set `status = disabled` for a first Android boot (seacliff: qseecom; VIDC stays on for Venus) |
+| `QKX_NOMAP_NODES` | reserved-memory nodes forced `no-map` for a first Android boot (splash, secure UI) |
 
-Concrete values live in the board files, not here: `boards/seacliff.sh` is
-complete today, and `boards/hollywood.sh` is partial until a live Quest 2 capture
-fills in its device-specific addresses. Anything that can be derived at runtime
-stays derived rather than stored, which keeps the board files minimal.
+Concrete values live in the board files, not here. `boards/seacliff.sh` is
+complete; `boards/hollywood.sh` is complete except for its first-time-setup APK
+name, still to be identified.
+
+`QKX_DISABLE_NODES` and `QKX_NOMAP_NODES` are a deliberate special case. On Kona
+these nodes come from the shared `kona.dtsi`, so seacliff and hollywood carry
+identical values, and the install flow still applies them directly rather than
+reading the board file. They are kept in the schema as the extension point for a
+future non-Kona board (e.g. Quest 3, SM8550), where the nodes and addresses would
+genuinely differ; wiring the install flow to read them is left until such a board
+exists and can be tested. Anything else that can be derived at runtime stays
+derived rather than stored, which keeps the board files minimal.
 
 ## Tier 2 — per-boot runtime data
 
@@ -145,7 +157,7 @@ Every site that encodes a board fact today, and where it moves:
 | `tools/build-system-package.py:34`, `tools/build-rom-package.py:26` | manifest `device` = `"Quest Pro (seacliff)"` | `QKX_BOARD_LABEL` |
 | `tools/build-turnkey-images.py:19` | `FirstTimeNuxSeacliff.apk` | `QKX_NUX_APK` |
 | `initramfs/init.sh:33`, `initramfs/ramtest-init.sh:33` | USB manufacturer `quest-pro-kexec` | `QKX_USB_MANUFACTURER` |
-| prep-time DT edits (`docs/KEXEC_RAM_12GB_RESCUE.md:188-190`) | splash `no-map`, qseecom/vidc disable | `QKX_SPLASH_*`, `QKX_DISABLE_NODES` (the `/memory` reg is Tier 2 — from capture) |
+| `qkx-install-package.sh` prep-time DT edits | qseecom `disabled`, splash + secure-display `no-map` | SoC-fixed on Kona; left as constants, mirrored into `QKX_DISABLE_NODES` / `QKX_NOMAP_NODES` as the extension point for a future non-Kona board (the `/memory` reg is Tier 2 — from capture) |
 | `module/loader.c:2`, `:1136`; `tools/prepare.py:2`, `:104` | "Quest Pro" wording | generalize text (cosmetic) |
 | `tools/disable-alt-updaters.py:7` | `ROOT=Path('/home/yusuf/kexectest/work')` | not a board fact — an author's environment path, left out of `boards/` deliberately |
 
