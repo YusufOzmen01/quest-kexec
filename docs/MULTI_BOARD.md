@@ -159,10 +159,9 @@ Every site that encodes a board fact today, and where it moves:
 | `initramfs/init.sh:33`, `initramfs/ramtest-init.sh:33` | USB manufacturer `quest-pro-kexec` | `QKX_USB_MANUFACTURER` |
 | `qkx-install-package.sh` prep-time DT edits | qseecom `disabled`, splash + secure-display `no-map` | SoC-fixed on Kona; left as constants, mirrored into `QKX_DISABLE_NODES` / `QKX_NOMAP_NODES` as the extension point for a future non-Kona board (the `/memory` reg is Tier 2 — from capture) |
 | `module/loader.c:2`, `:1136`; `tools/prepare.py:2`, `:104` | "Quest Pro" wording | generalize text (cosmetic) |
-| `tools/disable-alt-updaters.py:7` | `ROOT=Path('/home/yusuf/kexectest/work')` | not a board fact — an author's environment path, left out of `boards/` deliberately |
+| `tools/disable-alt-updaters.py` | hardcoded author path `ROOT=Path('/home/yusuf/...')` | not a board fact — made a required `images` argument |
 
 The last two rows carry no board semantics. The "Quest Pro" strings are cosmetic
-and generalize. The `/home/yusuf/...` path in `disable-alt-updaters.py` is one
-contributor's local working directory; it is noted here so it is not mistaken for
-a board fact. It should become an argument or environment variable, but that is a
-separate cleanup.
+and generalize. The `/home/yusuf/...` path in `disable-alt-updaters.py` was one
+contributor's local working directory, not a board fact; it is now passed as a
+required `images` argument.
