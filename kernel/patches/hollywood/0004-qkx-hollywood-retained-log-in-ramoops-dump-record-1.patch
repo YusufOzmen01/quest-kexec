@@ -1,0 +1,22 @@
+From: Quest2 port <noreply@localhost>
+Subject: [PATCH 4/4] qkx: hollywood retained log in ramoops dump record 1
+
+Quest 2 ramoops (0x9ba00000+0x90000, record/console/pmsg 0x20000) lays
+out dump 0x9ba00000-0x9ba50000, console -0x9ba70000, pmsg -0x9ba90000,
+so the Quest Pro address 0x9ba80000 is inside pmsg, which logd rewrites
+continuously. Move the 64K log to 0x9ba30000, inside dump record 1,
+clear of its header. marker_read must be built with the same address
+(make module QKX_LOG_PHYS=0x9ba30000).
+---
+--- a/init/main.c
++++ b/init/main.c
+@@ -553,7 +553,8 @@
+ 	pti_init();
+ }
+ 
+-#define QKX_LOG_PHYS 0x9ba80000ULL
++/* hollywood: 0x9ba80000 is inside the ramoops pmsg zone; use dump record 1. */
++#define QKX_LOG_PHYS 0x9ba30000ULL
+ #define QKX_LOG_SIZE 0x10000
+ #define QKX_LOG_MAGIC 0x514b584c
+ 

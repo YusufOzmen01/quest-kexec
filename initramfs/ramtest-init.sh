@@ -30,7 +30,7 @@ mkdir -p "$g/strings/0x409" "$g/configs/c.1/strings/0x409" "$g/functions/ecm.usb
 echo 0x1d6b > "$g/idVendor"
 echo 0x0105 > "$g/idProduct"
 echo QKX-RAM > "$g/strings/0x409/serialnumber"
-echo 'quest-pro-kexec' > "$g/strings/0x409/manufacturer"
+echo "${QKX_USB_MANUFACTURER:-quest-pro-kexec}" > "$g/strings/0x409/manufacturer"
 echo 'RAM-only USB Ethernet shell' > "$g/strings/0x409/product"
 echo 'ECM' > "$g/configs/c.1/strings/0x409/configuration"
 echo 250 > "$g/configs/c.1/MaxPower"

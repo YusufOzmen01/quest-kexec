@@ -4,6 +4,7 @@
 # Revalidation only: ./qkx-install-package.sh --verify-only ZIP
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/tools/board.sh"
 VERIFY_ONLY=0
 if [ "${1:-}" = --verify-only ]; then VERIFY_ONLY=1; shift; fi
 ZIP=${1:-}
@@ -12,14 +13,17 @@ ZIP=$(readlink -f "$ZIP")
 [ -f "$ZIP" ] || { echo "Package not found: $ZIP"; exit 1; }
 
 verify_zip() {
- python3 - "$1" <<'PY'
+ python3 - "$@" <<'PY'
 import hashlib,json,sys,zipfile
 z=zipfile.ZipFile(sys.argv[1]); names=set(z.namelist())
+known=set(sys.argv[2:])
 try: m=json.loads(z.read('manifest.json'))
 except Exception as e: raise SystemExit('invalid manifest: '+str(e))
-fmt=m.get('format')
-if fmt not in ('qkx-system-package-v1','qkx-rom-package-v1') or m.get('device')!='Quest Pro (seacliff)':
- raise SystemExit('unsupported package/device')
+fmt=m.get('format'); dev=m.get('device')
+if fmt not in ('qkx-system-package-v1','qkx-rom-package-v1'):
+ raise SystemExit('unsupported package format')
+if dev not in known:
+ raise SystemExit('unrecognized device: '+str(dev))
 required={'images/'+x+'.img' for x in ('system','system_ext','vendor','odm','product')}
 required|={'qkx-turnkey.json'}
 if fmt=='qkx-system-package-v1':
@@ -35,11 +39,25 @@ for n,s in m['files'].items():
 print('PACKAGE VERIFIED')
 PY
 }
-verify_zip "$ZIP"
+# Labels of every board this tree knows, for offline package verification.
+KNOWN_LABELS=()
+for bf in "$HERE"/boards/*.sh; do
+ lbl="$(. "$bf"; printf '%s' "${QKX_BOARD_LABEL:-}")"
+ [ -n "$lbl" ] && KNOWN_LABELS+=("$lbl")
+done
+verify_zip "$ZIP" "${KNOWN_LABELS[@]}"
 [ "$VERIFY_ONLY" = 0 ] || exit 0
 adb shell 'su -c id' </dev/null | grep -q 'uid=0' || { echo 'Rooted adb is required'; exit 1; }
 MODEL=$(adb shell getprop ro.product.device </dev/null | tr -d '\r')
-[ "$MODEL" = seacliff ] || { echo "Refusing non-Quest-Pro device: $MODEL"; exit 1; }
+qkx_board_load "$MODEL" || { echo "Refusing unsupported device: $MODEL"; exit 1; }
+# The package must be built for this headset's board, not merely a known one.
+PKG_DEVICE=$(python3 - "$ZIP" <<'PY'
+import json,sys,zipfile
+print(json.loads(zipfile.ZipFile(sys.argv[1]).read('manifest.json')).get('device',''))
+PY
+)
+[ "$PKG_DEVICE" = "$QKX_BOARD_LABEL" ] ||
+ { echo "Package is for '$PKG_DEVICE', not this headset ('$QKX_BOARD_LABEL')"; exit 1; }
 read -r -p 'Alternate /data size in GiB [16]: ' DATA_GIB
 DATA_GIB=${DATA_GIB:-16}
 [[ "$DATA_GIB" =~ ^[0-9]+$ ]] && [ "$DATA_GIB" -ge 4 ] && [ "$DATA_GIB" -le 128 ] || { echo 'Choose 4..128 GiB'; exit 1; }

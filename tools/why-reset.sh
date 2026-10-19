@@ -14,7 +14,15 @@
 set -uo pipefail
 T=${1:-}
 
-run() { adb shell "su -c '$1'" 2>/dev/null | tr -d '\r'; }
+# Device shell wrapper: wraps in `su -c` by default, or runs in a direct root
+# adb shell (`adb root`) when QKX_ADB_ROOT=1.
+run() {
+	if [ "${QKX_ADB_ROOT:-0}" = 1 ]; then
+		adb shell "$1" 2>/dev/null | tr -d '\r'
+	else
+		adb shell "su -c '$1'" 2>/dev/null | tr -d '\r'
+	fi
+}
 
 echo "=== PMIC power-on / power-off reasons (latched across the reset) ==="
 run 'dmesg | grep -iE "Power-on reason|Power-off reason"' | sed 's/^\[[^]]*\] *//'

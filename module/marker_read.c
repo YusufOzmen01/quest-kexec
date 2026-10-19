@@ -6,7 +6,10 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
-#define QKX_LOG_PHYS 0x9ba80000ULL
+/* hollywood (Q2) target kernel writes the QKX log here; 0x9ba80000 is inside the
+ * hollywood ramoops pmsg zone. Must match QKX_LOG_PHYS in the target kernel
+ * (oculus-linux-kernel-target init/main.c). */
+#define QKX_LOG_PHYS 0x9ba30000ULL
 #define QKX_LOG_SIZE 0x10000
 #define QKX_LOG_MAGIC 0x514b584c
 #define QKX_LOG_PAGES (QKX_LOG_SIZE / PAGE_SIZE)

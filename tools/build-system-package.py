@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Build the distributable Quest Pro alternate-Android ZIP and hash manifest."""
+"""Build the distributable alternate-Android ZIP and hash manifest."""
 import argparse, hashlib, json, os, tempfile, zipfile
 from pathlib import Path
+from board import load_board
 
 FILES = {
     'images/system.img': 'system.img', 'images/system_ext.img': 'system_ext.img',
@@ -19,7 +20,8 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('images',type=Path); p.add_argument('output',type=Path)
     p.add_argument('--kernel',type=Path,required=True); p.add_argument('--repo',type=Path,default=Path(__file__).resolve().parents[1])
-    a=p.parse_args(); repo=a.repo.resolve()
+    p.add_argument('--board',default='seacliff')
+    a=p.parse_args(); repo=a.repo.resolve(); board=load_board(a.board)
     sources={arc:(a.images/src).resolve() for arc,src in FILES.items()}
     sources.update({'kernel/Image':a.kernel.resolve(),
       'runtime/busybox':(repo/'out/busybox').resolve(),
@@ -31,7 +33,7 @@ def main():
     turnkey=a.images/'qkx-turnkey.json'
     if not turnkey.is_file(): raise SystemExit('images are not a turnkey set')
     sources['qkx-turnkey.json']=turnkey
-    manifest={'format':'qkx-system-package-v1','device':'Quest Pro (seacliff)',
+    manifest={'format':'qkx-system-package-v1','device':board['QKX_BOARD_LABEL'],
               'calibration':'read-current-stock-at-each-boot','files':{}}
     for arc,path in sources.items():
         manifest['files'][arc]={'size':path.stat().st_size,'sha256':digest(path)}

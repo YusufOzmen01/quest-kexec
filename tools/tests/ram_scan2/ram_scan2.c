@@ -12,7 +12,9 @@
 static unsigned long start_pfn;
 static unsigned long read_pages, reserved_pages, invalid_pages, busy_pages;
 module_param(start_pfn, ulong, 0444);
-static unsigned long end_pfn = PFN_DOWN(0x380000000ULL);
+/* 0 => derive the end of RAM at init (high_memory): 6 GiB on Quest 2,
+ * 12 GiB on Quest Pro. Pass a value to cap the scan lower. */
+static unsigned long end_pfn;
 module_param(end_pfn, ulong, 0444);
 
 static int scan_range(unsigned long pfn, unsigned long nr, void *arg)
@@ -52,7 +54,9 @@ static int __init ram_scan_init(void)
 {
 	unsigned long sum = 0;
 
-	pr_info("ramscan2: begin from pfn %#lx\n", start_pfn);
+	if (!end_pfn)
+		end_pfn = PFN_DOWN(virt_to_phys(high_memory));
+	pr_info("ramscan2: begin from pfn %#lx to %#lx\n", start_pfn, end_pfn);
 	scan_range(PFN_DOWN(0x80000000ULL), PFN_DOWN(0x300000000ULL), &sum);
 	pr_info("ramscan2: done sum=%lx read=%lu MiB reserved=%lu MiB unmapped=%lu MiB busy=%lu MiB\n",
 		sum, read_pages >> 8, reserved_pages >> 8, invalid_pages >> 8,
