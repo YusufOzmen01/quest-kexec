@@ -3,9 +3,13 @@
 Never opens a block device. Back up/unshare before editing Android ext4 images.
 """
 from pathlib import Path
-import hashlib, subprocess, tempfile
-ROOT=Path('/home/yusuf/kexectest/work')
-IMAGES=ROOT/'no-usb-images'
+import argparse, hashlib, subprocess, tempfile
+_ap=argparse.ArgumentParser(description=__doc__)
+_ap.add_argument('images', type=Path,
+                 help='directory containing system.img and system_ext.img to quarantine')
+_a=_ap.parse_args()
+IMAGES=_a.images.resolve()
+ROOT=IMAGES.parent   # backups are written next to the images directory
 FILES={
  'system': ['/system/etc/init/update_engine.rc', '/system/bin/update_engine',
             '/system/bin/update_engine_client', '/system/bin/update_verifier', '/system/bin/postinstall'],

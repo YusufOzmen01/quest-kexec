@@ -418,7 +418,7 @@ assert that unrelated firmware-update code has been audited.
 Backups: `work/system-pre-disable-updater-cm.img` and
 `work/system_ext-pre-disable-updater-cm.img`. Actual system_ext source remains
 `work/no-vision-images/system_ext.img` via the no-usb-images symlink.
-Script: `tools/disable-alt-updaters.py` (workspace-specific paths; refuses to
+Script: `tools/disable-alt-updaters.py <images-dir>` (refuses to
 overwrite backups). It expands each host image by 256 MiB, unshares ext4
 shared blocks before edits, verifies each quarantined file's SHA-256 against
 its original, and requires a clean final e2fsck. Restore by replacing host

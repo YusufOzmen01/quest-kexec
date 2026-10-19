@@ -8,8 +8,13 @@ P=$1; shift
 T=/data/local/tmp
 MOD=${QKX_LOADER_MODULE:-$HERE/module/quest_kexec.ko}
 MARKER=${QKX_MARKER_MODULE:-$HERE/module/marker_read.ko}
+. "$HERE/tools/board.sh"
+BOARD=$(qkx_board_detect "${QKX_BOARD:-}") ||
+	{ echo "run.sh: could not determine board (set QKX_BOARD or connect a device)"; exit 1; }
+qkx_board_load "$BOARD" || exit 1
 PARAMS="execute=1 preserve_watchdog=1 watchdog_recovery=0 core_hang_control=2 \
-flush_rpmh=1 suspend_syncboss=1 disconnect_qmp=0 phase_delay_ms=300 $*"
+flush_rpmh=1 suspend_syncboss=1 disconnect_qmp=0 phase_delay_ms=300 \
+syncboss_spi=$QKX_SYNCBOSS_SPI $*"
 
 for f in "$MOD" "$MARKER" "$P/Image" "$P/initramfs" "$P/boot.dtb"; do
 	[ -f "$f" ] || { echo "missing $f"; exit 1; }

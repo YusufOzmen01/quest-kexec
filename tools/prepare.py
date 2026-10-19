@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare Image + initramfs + DTB for the Quest Pro kexec staging layout.
+"""Prepare Image + initramfs + DTB for the Kona kexec staging layout.
 
 The Android boot image is optional; it is only needed when the kernel or
 initramfs is taken from it.
@@ -101,7 +101,7 @@ def main():
                       image_file_size=len(kernel), replacement_kernel=str(a.kernel_image),
                       kernel_sha256=hashlib.sha256(kernel).hexdigest())
     if report["text_offset"] != 0x80000 or report["image_size"] > 0x2F80000:
-        raise ValueError("image does not fit this Quest Pro staging layout")
+        raise ValueError("image does not fit the Kona staging layout")
     initrd = a.initramfs.read_bytes() if a.initramfs else original
     dtb = a.live_dtb.read_bytes()
     if len(dtb) < 40 or struct.unpack_from(">I", dtb)[0] != 0xD00DFEED:

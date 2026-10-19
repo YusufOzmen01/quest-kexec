@@ -24,9 +24,19 @@ static unsigned long smmu_tables;
 static struct iommu_domain *seen_domains[256];
 static unsigned int seen_count;
 
+/* End of DRAM, resolved once at the start of the walk (see dump_smmu_tables).
+ * high_memory is the top of the linear map, i.e. memblock_end_of_DRAM(); this
+ * is 6 GiB on Quest 2 and 12 GiB on Quest Pro. pfn_valid() below rejects any
+ * page above the real RAM top anyway, so the bound is only a coarse pre-filter. */
+static phys_addr_t secmap_ram_top;
+static void secmap_ram_resolve(void)
+{
+ secmap_ram_top = virt_to_phys(high_memory);
+ pr_info("ionsec: ram top %pa\n", &secmap_ram_top);
+}
 static bool secmap_ram(phys_addr_t pa)
 {
- return pa >= 0x80000000ULL && pa < 0x380000000ULL && pfn_valid(PHYS_PFN(pa));
+ return pa >= 0x80000000ULL && pa < secmap_ram_top && pfn_valid(PHYS_PFN(pa));
 }
 static void secmap_walk(phys_addr_t pa, unsigned int level, unsigned int entries)
 {
@@ -92,6 +102,7 @@ static int secmap_device(struct device *dev, void *unused)
 }
 static void dump_smmu_tables(void)
 {
+ secmap_ram_resolve();
  if (kgsl_drv && kgsl_drv->devp[0]) {
   struct kgsl_pagetable *pt = kgsl_drv->devp[0]->mmu.securepagetable;
   if (pt && pt->priv) {

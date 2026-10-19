@@ -12,8 +12,8 @@
 #include <linux/scatterlist.h>
 #include <linux/mm.h>
 #include <linux/msm_ion.h>
-#include "../../oculus-linux-kernel-android/drivers/staging/android/ion/ion.h"
-#include "../../oculus-linux-kernel-android/drivers/staging/android/ion/ion_system_heap.h"
+#include "ion.h"			/* -I .../drivers/staging/android/ion (KSRC) */
+#include "ion_system_heap.h"
 #include <linux/kprobes.h>
 #include "kgsl_device.h"
 
